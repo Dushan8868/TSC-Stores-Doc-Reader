@@ -2048,13 +2048,20 @@ function addManualPage(slip){
 
 /* ---- Claude API (direct from the browser) ---- */
 async function apiCall(body){
-  if(!S.apiKey) throw {code:'not_granted',message:'No API key'};
+  const proxy=useProxy();
+  if(!S.apiKey&&!proxy) throw {code:'not_granted',message:'No API key'};
   let wait=4000;
   for(let attempt=0;attempt<4;attempt++){
     let res;
-    try{ res=await fetch(API_URL,{method:'POST',headers:{'content-type':'application/json','x-api-key':S.apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify(body)}); }
-    catch(e){ throw {code:'network',message:'Could not reach the Claude API. Check the internet connection.'}; }
+    try{
+      if(proxy){ const ss=(await cloudClient().auth.getSession()).data.session, c=cloudConf();
+        res=await fetch(c.url+'/functions/v1/claude',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+(ss&&ss.access_token||''),'apikey':c.key},body:JSON.stringify(body)}); }
+      else res=await fetch(API_URL,{method:'POST',headers:{'content-type':'application/json','x-api-key':S.apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify(body)});
+    }
+    catch(e){ throw {code:'network',message:proxy?'Could not reach the shared Claude reader. Check the internet connection, or ask the administrator whether the "claude" function is deployed.':'Could not reach the Claude API. Check the internet connection.'}; }
     if(res.ok) return res.json();
+    if(proxy&&res.status===404) throw {code:'proxy_missing'};
+    if(proxy&&res.status===401) throw {code:'proxy_auth'};
     if(res.status===401||res.status===403) throw {code:'not_granted',message:'The API key was not accepted.'};
     if(res.status===429||res.status===529||res.status>=500){
       if(attempt===3) throw {code:res.status===429?'rate_limited':'upstream_error'};
@@ -2107,11 +2114,14 @@ function browserDownloads(){
     setTimeout(()=>URL.revokeObjectURL(url),5000); return 'saved';
   }};
 }
-function canRead(){ return !!(S.sample&&S.apiKey); }
+function useProxy(){ return !S.apiKey&&CLOUD.on&&!!CLOUD.user; }
+function canRead(){ return !!(S.sample&&(S.apiKey||useProxy())); }
 function readWarnText(){ return 'Add your Claude API key on the Settings tab to read scans.'; }
 function sampleErrText(e){
   const c=e&&e.code;
-  if(c==='not_granted') return 'The API key was not accepted. Check it on the Settings tab.';
+  if(c==='proxy_missing') return 'The shared Claude reader is not set up yet. Ask the administrator to deploy the "claude" function in Supabase, or enter your own API key on the Settings tab.';
+  if(c==='proxy_auth') return 'Your sign-in has expired. Sign out and sign in again.';
+  if(c==='not_granted') return useProxy()?'The company Claude key on the server was not accepted. Ask the administrator to check the ANTHROPIC_API_KEY secret in Supabase.':'The API key was not accepted. Check it on the Settings tab.';
   if(c==='network') return e.message;
   if(c==='rate_limited') return 'The API is busy or the account limit was reached. Wait a minute, then press Read again.';
   if(c==='invalid_json') return 'The answer was not in the expected format. Read the page again.';
@@ -2142,7 +2152,7 @@ function viewSettings(){
   const custom=!MODELS.some(([id])=>id===S.model);
   return '<section class="guide"><h1>Settings</h1><p class="lede">Scans are read by Claude through the Claude API. Enter the API key once on each computer that uses this file.</p>'+
    '<div class="slip" style="padding:16px 18px"><div class="fields" style="padding:0;grid-template-columns:1fr">'+
-   '<label>Claude API key<input type="password" id="s-key" value="'+esc(S.apiKey)+'" autocomplete="off" spellcheck="false" placeholder="sk-ant-…"></label>'+
+   '<label>Claude API key'+(CLOUD.on?' (leave empty to use the shared company reader)':'')+'<input type="password" id="s-key" value="'+esc(S.apiKey)+'" autocomplete="off" spellcheck="false" placeholder="'+(CLOUD.on?'Empty = shared company reader':'sk-ant-…')+'"></label>'+
    '<label style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="s-remember"'+(S.remember?' checked':'')+'> Remember the key on this computer</label>'+
    '<label>Reading model<select id="s-model">'+MODELS.map(([id,l])=>'<option value="'+id+'"'+((custom?id==='custom':id===S.model)?' selected':'')+'>'+esc(l)+'</option>').join('')+'</select></label>'+
    '<label id="s-custom-wrap"'+(custom?'':' hidden')+'>Model ID<input id="s-custom" value="'+esc(custom?S.model:'')+'" spellcheck="false"></label>'+
@@ -2161,7 +2171,7 @@ function saveSettings(){
   const m=$('#s-msg'); if(m) m.textContent='Saved.'; toast(S.apiKey?'Settings saved. You can read scans now.':'Settings saved.');
 }
 async function testKey(){
-  pullSettings(); const m=$('#s-msg'); if(!S.apiKey){ if(m) m.textContent='Enter the key first.'; return; }
+  pullSettings(); const m=$('#s-msg'); if(!S.apiKey&&!useProxy()){ if(m) m.textContent='Enter the key first.'; return; }
   if(m) m.textContent='Checking…';
   try{ await apiCall({model:S.model,max_tokens:5,messages:[{role:'user',content:'Reply with OK.'}]}); if(m) m.textContent='The key and model work.'; }
   catch(e){ if(m) m.textContent=sampleErrText(e); }
@@ -2318,8 +2328,8 @@ async function cloudStart(){
     const n=await cloudLoadAll();
     try{ S.sap=await cloudLoadSap(); CLOUD.sapAt=S.sap&&S.sap.at||''; }catch(e){ S.sap=null; }
     try{ await cloudLoadSettings(); }catch(e){}
-    S.tab=S.apiKey?'scan':'settings'; render();
-    toast(pl(n,'page')+' in the shared database.'+(S.apiKey?'':' Add your Claude API key to read new scans.'));
+    S.tab='scan'; S.aiImages=true; render();
+    toast(pl(n,'page')+' in the shared database.');
   }catch(e){ S.tab='signin'; CLOUD.loginErr='The shared database could not be opened: '+((e&&e.message)||'unknown error')+'. Check that the setup script was run in Supabase.'; render(); return; }
   clearInterval(CLOUD.poll); CLOUD.poll=setInterval(cloudSync,60000);
   window.addEventListener('focus',()=>cloudSync());
