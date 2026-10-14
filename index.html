@@ -1772,6 +1772,7 @@ async function restoreBackup(file){
   try{ zip=await window.JSZip.loadAsync(file); const f=zip.file('slips.json'); if(!f) throw new Error('slips.json is missing'); meta=JSON.parse(await f.async('string')); }
   catch(e){ toast('This is not a backup made by this app ('+((e&&e.message)||'unreadable')+').'); return; }
   let added=0, back=0, kept=0;
+  const shared=typeof CLOUD!=='undefined'&&CLOUD.on; if(shared) CLOUD.bulk=new Set();
   for(const r of (meta.pages||[])){
     if(!r||!r.key) continue;
     let blob=null; if(r.image&&zip.file(r.image)) blob=new Blob([await zip.file(r.image).async('arraybuffer')],{type:'image/jpeg'});
@@ -1782,6 +1783,8 @@ async function restoreBackup(file){
     S.scan.pages.push(pg); cacheRead(pg); keepImage(pg); added++;
   }
   S.scan.pages.sort((a,b)=>(a.order||0)-(b.order||0));
+  if(shared){ const b=[...CLOUD.bulk]; CLOUD.bulk=null; refreshScan(true); const r=await cloudBulkSave(b,'Saving the backup to the shared database'); const c=await cloudCounts();
+    toast('Backup restored and saved to the shared database: '+pl(r.rows,'slip')+', '+pl(r.imgs,'scan')+(r.fail?' – '+r.fail+' could not be saved, see the message at the top':'')+'. The shared database now holds '+pl(c.pages,'slip')+'.'); refreshScan(true); return; }
   toast('Backup restored: '+pl(added,'slip')+' added'+(back?', '+pl(back,'scan')+' put back':'')+(kept?', '+kept+' already here':'')+'.');
   refreshScan(true);
 }
@@ -2000,10 +2003,10 @@ const idbAll=s=>idbDo(s,'readonly',st=>st.getAll()).catch(()=>[]);
 const idbCount=s=>idbDo(s,'readonly',st=>st.count()).catch(()=>0);
 const idbGet=(s,k)=>idbDo(s,'readonly',st=>st.get(k)).catch(()=>null);
 let imgWarned=false;
-function keepImage(pg){ if(CLOUD.on){ cloudSaveImage(pg); return; } if(!pg.blob||!pg.key) return; idbDo('images','readwrite',st=>st.put({key:pg.key,blob:pg.blob,thumb:pg.thumb})).catch(()=>{ if(!imgWarned){ imgWarned=true; toast('This computer has no room to keep the scan images. The readings are still kept.'); } }); }
+function keepImage(pg){ if(CLOUD.on){ if(CLOUD.bulk){ CLOUD.bulk.add(pg); return; } cloudSaveImage(pg); return; } if(!pg.blob||!pg.key) return; idbDo('images','readwrite',st=>st.put({key:pg.key,blob:pg.blob,thumb:pg.thumb})).catch(()=>{ if(!imgWarned){ imgWarned=true; toast('This computer has no room to keep the scan images. The readings are still kept.'); } }); }
 
 function pageRecord(pg){ return {key:pg.key,fileKey:pg.fileKey||'',page:pg.pageNo,name:pg.name,draft:pg.draft,rot:pg.rot||0,aiRot:pg.aiRot||0,checked:!!pg.checked,manual:!!pg.manual,order:pg.order||0,at:new Date().toISOString()}; }
-function cacheRead(pg){ if(CLOUD.on){ cloudSavePage(pg); return; } const rec=pageRecord(pg); idbPut('batch',rec); if(pg.draft&&!pg.manual) idbPut('reads',rec); }
+function cacheRead(pg){ if(CLOUD.on){ if(CLOUD.bulk){ CLOUD.bulk.add(pg); return; } cloudSavePage(pg); return; } const rec=pageRecord(pg); idbPut('batch',rec); if(pg.draft&&!pg.manual) idbPut('reads',rec); }
 async function saveSapData(d){ if(CLOUD.on){ await cloudSaveSap(d); return; } if(d) await idbPut('sap',{key:'data',data:d}); else await idbDel('sap','data'); }
 async function loadSapData(){ if(CLOUD.on) return cloudLoadSap(); const r=await idbGet('sap','data'); return r&&r.data||null; }
 function forgetImages(pages){ if(CLOUD.on) return; for(const p of pages||[]) if(p.key) idbDel('images',p.key); }
@@ -2146,6 +2149,7 @@ function extraView(tab){
 }
 function afterExtra(tab){
   if(tab==='scan'){ afterScan(); return; }
+  if(tab==='settings'&&CLOUD.on) cloudSettingsStatus();
   if(tab==='settings') Promise.all([idbCount('reads'),idbCount('images')]).then(([n,m])=>{ const el=$('#s-count'); if(el) el.textContent=pl(n,'reading')+' and '+pl(m,'scan image')+' kept on this computer.'; });
 }
 function viewSettings(){
@@ -2255,6 +2259,52 @@ async function cloudPushPage(pg){
   if(error) cloudErr(error); else if(CLOUD.err){ CLOUD.err=''; setBanner(''); }
 }
 async function cloudFlush(){ const ks=[...CLOUD.timers.keys()]; for(const k of ks){ clearTimeout(CLOUD.timers.get(k)); const pg=S.scan.pages.find(p=>p.key===k); if(pg) await cloudPushPage(pg); else CLOUD.timers.delete(k); } }
+async function cloudUploadImage(pg){
+  if(!pg.blob||!pg.key) return false;
+  try{
+    let up=pg.blob;
+    try{ const bmp=await createImageBitmap(pg.blob), k=Math.min(1,2000/Math.max(bmp.width,bmp.height)); if(k<1){ const c=document.createElement('canvas'); c.width=Math.round(bmp.width*k); c.height=Math.round(bmp.height*k); c.getContext('2d').drawImage(bmp,0,0,c.width,c.height); up=await toBlob(c,'image/jpeg',0.82)||pg.blob; } if(bmp.close) bmp.close(); }catch(e){}
+    const {error}=await cloudClient().storage.from('scans').upload(pg.key+'.jpg',up,{upsert:true,contentType:'image/jpeg'});
+    if(error){ cloudErr(error,'save the scan image'); return false; }
+    pg.remoteImage=true; return true;
+  }catch(e){ cloudErr(e,'save the scan image'); return false; }
+}
+async function cloudBulkSave(pages,label){
+  const sb=cloudClient(), list=[...new Map((pages||[]).filter(p=>p&&p.key).map(p=>[p.key,p])).values()];
+  let rows=0, imgs=0, fail=0;
+  for(let i=0;i<list.length;i+=50){
+    const chunk=list.slice(i,i+50).map(p=>Object.assign(pageToRow(p),p.remoteImage?{has_image:true}:{}));
+    const {error}=await sb.from('slip_pages').upsert(chunk,{onConflict:'key'});
+    if(error){ fail+=chunk.length; cloudErr(error); } else rows+=chunk.length;
+    setBanner((label||'Saving to the shared database')+': '+rows+' of '+list.length+' slips…');
+  }
+  const todo=list.filter(p=>p.blob&&!p.remoteImage);
+  for(let i=0;i<todo.length;i++){ if(await cloudUploadImage(todo[i])) imgs++; else fail++; setBanner('Saving the scans to the shared database: '+(i+1)+' of '+todo.length+'…'); }
+  const done=todo.filter(p=>p.remoteImage);
+  for(let i=0;i<done.length;i+=25){ const {error}=await sb.from('slip_pages').upsert(done.slice(i,i+25).map(p=>Object.assign(pageToRow(p),{has_image:true,thumb:p.thumb||null})),{onConflict:'key'}); if(error){ cloudErr(error); fail++; } }
+  setBanner(fail?'Some items could not be saved to the shared database ('+fail+'). Open Settings and press "Upload everything shown here" to try again.':'');
+  return {rows,imgs,fail};
+}
+async function cloudCounts(){
+  try{ const sb=cloudClient(), a=await sb.from('slip_pages').select('key',{count:'exact',head:true}).eq('deleted',false), b=await sb.from('slip_pages').select('key',{count:'exact',head:true}).eq('deleted',false).eq('has_image',true); return {pages:a.count||0,imgs:b.count||0,ok:!a.error}; }
+  catch(e){ return {pages:0,imgs:0,ok:false}; }
+}
+async function localLeftovers(){ try{ await idb(); }catch(e){ return []; } return (await idbAll('batch')).filter(r=>r&&r.key&&!S.scan.pages.some(p=>p.key===r.key)); }
+async function cloudSettingsStatus(){
+  const st=$('#cl-status'), lo=$('#cl-local'); if(!st) return;
+  const c=await cloudCounts();
+  st.textContent=c.ok?'The shared database holds '+pl(c.pages,'slip')+' ('+pl(c.imgs,'scan')+'). This screen shows '+pl(S.scan.pages.length,'slip')+'.':'The shared database could not be counted. Check the internet connection.';
+  const left=await localLeftovers();
+  if(lo) lo.innerHTML=left.length?'This computer still has <b>'+pl(left.length,'slip')+'</b> saved before the shared database was connected. <button type="button" class="btn" data-act="cloudCopyLocal">Copy them to the shared database</button>':'';
+}
+async function cloudCopyLocal(){
+  const recs=await localLeftovers(), add=[];
+  for(const r of recs){ const id='pg'+Math.random().toString(36).slice(2,9), d=r.draft||null; if(d) d.fromScan=id; const im=await idbGet('images',r.key);
+    add.push({id,name:r.name,pageNo:r.page,fileKey:r.fileKey,key:r.key,blob:im&&im.blob||null,thumb:im&&im.thumb||'',rot:r.rot||0,aiRot:r.aiRot||0,rotKnown:true,status:d?'read':'new',draft:d,error:'',preview:'',checked:!!r.checked,manual:!!r.manual,order:r.order||0}); }
+  S.scan.pages.push(...add); S.scan.pages.sort((a,b)=>(a.order||0)-(b.order||0));
+  const res=await cloudBulkSave(add,'Copying this computer’s work to the shared database');
+  toast(pl(res.rows,'slip')+' and '+pl(res.imgs,'scan')+' copied to the shared database'+(res.fail?' – '+res.fail+' could not be saved':'')+'.'); cloudSettingsStatus();
+}
 async function cloudSaveImage(pg){
   if(!pg.blob||!pg.key) return;
   try{
@@ -2357,7 +2407,7 @@ function viewSignIn(){
 function cloudSettingsHTML(){
   const c=cloudConf(), on=CLOUD.on&&CLOUD.user;
   return '<h2>Shared database</h2>'+(on
-   ?'<p>Connected to <b>'+esc(c.url)+'</b> as <b>'+esc(cloudWho())+'</b>. Slips, scans, corrections, the SAP data and the G/L mapping are shared with everyone who signs in. Changes from others appear within a minute.</p><p><button type="button" class="btn ghost" data-act="cloudSync">Get the latest now</button> <button type="button" class="btn ghost" data-act="cloudSignOut">Sign out</button></p>'
+   ?'<p>Connected to <b>'+esc(c.url)+'</b> as <b>'+esc(cloudWho())+'</b>. Slips, scans, corrections, the SAP data and the G/L mapping are shared with everyone who signs in. Changes from others appear within a minute.</p><p class="hint" id="cl-status">Checking the shared database…</p><p id="cl-local"></p><p><button type="button" class="btn ghost" data-act="cloudSync">Get the latest now</button> <button type="button" class="btn ghost" data-act="cloudRepush">Upload everything shown here</button> <button type="button" class="btn ghost" data-act="cloudSignOut">Sign out</button></p>'
    :'<p>Not connected – the work is kept on this computer only. To share it, enter the Supabase project URL and the anon public key (Supabase → Project settings → API), then sign in.</p>')+
    (c.fromFile?'<p class="hint">The connection comes from config.js next to this page.</p>':
    '<div class="fields" style="padding:0;grid-template-columns:1fr"><label>Supabase project URL<input id="s-sburl" value="'+esc(lsGet('sir.sbUrl')||'')+'" placeholder="https://xxxx.supabase.co" spellcheck="false"></label><label>Anon public key<input id="s-sbkey" value="'+esc(lsGet('sir.sbKey')||'')+'" spellcheck="false"></label></div><p><button type="button" class="btn ghost" data-act="cloudSave">Save and connect</button>'+(lsGet('sir.sbUrl')?' <button type="button" class="link" data-act="cloudForget">Stop using the shared database on this computer</button>':'')+'</p>');
@@ -2366,7 +2416,9 @@ function cloudAct(a){
   const k=a.dataset.act;
   if(k==='cloudSignIn'){ lsSet('sir.lastEmail',(($('#li-email')||{}).value||'').trim()); cloudSignIn(); return true; }
   if(k==='cloudSignOut'){ cloudSignOut(); return true; }
-  if(k==='cloudSync'){ cloudSync().then(()=>toast('Up to date.')); return true; }
+  if(k==='cloudSync'){ cloudSync().then(()=>{ toast('Up to date.'); cloudSettingsStatus(); }); return true; }
+  if(k==='cloudRepush'){ a.disabled=true; cloudBulkSave(S.scan.pages,'Uploading everything shown here').then(r=>{ a.disabled=false; toast(pl(r.rows,'slip')+' and '+pl(r.imgs,'scan')+' saved to the shared database'+(r.fail?' – '+r.fail+' failed':'')+'.'); cloudSettingsStatus(); }); return true; }
+  if(k==='cloudCopyLocal'){ a.disabled=true; cloudCopyLocal(); return true; }
   if(k==='cloudSave'){ const u=(($('#s-sburl')||{}).value||'').trim(), key=(($('#s-sbkey')||{}).value||'').trim(); if(!/^https:\/\/.+/.test(u)||key.length<20){ toast('Enter the project URL (https://…) and the anon key.'); return true; } lsSet('sir.sbUrl',u); lsSet('sir.sbKey',key); location.reload(); return true; }
   if(k==='cloudForget'){ if(armed(a,'Click again – this computer will work on its own')){ lsSet('sir.sbUrl',''); lsSet('sir.sbKey',''); location.reload(); } return true; }
   return false;
