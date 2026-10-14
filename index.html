@@ -2213,7 +2213,8 @@ async function init(){
 
 /* ---- shared database (Supabase): everyone who signs in sees the same slips, scans, SAP data and G/L mapping ---- */
 const CLOUD={on:false,client:null,user:null,lastSync:'',timers:new Map(),asked:new Set(),busy:false,poll:0,err:''};
-function cloudConf(){ const c=window.SIR_CONFIG||{}, u=(lsGet('sir.sbUrl')||'').trim(), k=(lsGet('sir.sbKey')||'').trim(); return {url:u||String(c.supabaseUrl||'').trim(),key:k||String(c.supabaseKey||'').trim(),fromFile:!u&&!!c.supabaseUrl}; }
+function sbBase(v){ const t=String(v||'').trim(); if(!t) return ''; try{ return new URL(t).origin; }catch(e){ return t.replace(/\/(rest|auth|storage)\/v1.*$/i,'').replace(/\/+$/,''); } }
+function cloudConf(){ const c=window.SIR_CONFIG||{}, u=sbBase(lsGet('sir.sbUrl')), k=(lsGet('sir.sbKey')||'').trim(); return {url:u||sbBase(c.supabaseUrl),key:k||String(c.supabaseKey||'').trim(),fromFile:!u&&!!c.supabaseUrl}; }
 function cloudWanted(){ const c=cloudConf(); return !!(c.url&&c.key); }
 function cloudReady(){ return cloudWanted()&&!!(window.supabase&&window.supabase.createClient); }
 function cloudClient(){ if(!CLOUD.client){ const c=cloudConf(); CLOUD.client=window.supabase.createClient(c.url,c.key,{auth:{persistSession:true,autoRefreshToken:true,storageKey:'sir-auth'}}); } return CLOUD.client; }
