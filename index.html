@@ -200,6 +200,8 @@ input.unsure,select.unsure{border:1px solid var(--warn)!important}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4"></script>
+<script src="config.js" onerror="window.SIR_CONFIG=window.SIR_CONFIG||null"></script>
 <script>
 (function(){
 'use strict';
@@ -517,7 +519,7 @@ function curTab(){ return S.tab==='edit'?S.from:S.tab; }
 function renderChrome(){
   if(S.monthAuto) S.month=defaultMonth();
   const n=slipsInMonth().length;
-  const tabs=[['scan','Scan to report'],['slips','Register'],['new','New slip'],['reports','Register reports'],['guide','Guide']];
+  const tabs=[['scan','Scan to report'],['slips','Register'],['new','New slip'],['reports','Register reports'],['sap','SAP & G/L'],['guide','Guide']];
   $('#tabs').innerHTML=tabs.map(([k,l])=>'<button type="button" data-tab="'+k+'"'+(curTab()===k?' aria-current="page"':'')+'>'+esc(l)+(k==='slips'&&S.loaded?'<span class="count">'+n+'</span>':'')+'</button>').join('');
   const months=[...S.months].sort().reverse();
   $('#monthSel').innerHTML='<option value="all"'+(S.month==='all'?' selected':'')+'>All months</option>'+months.map(m=>'<option value="'+m+'"'+(m===S.month?' selected':'')+'>'+esc(monthLabel(m))+'</option>').join('');
@@ -532,6 +534,7 @@ function render(){
     else if(S.tab==='edit'){ if(!S.editor){ S.tab='slips'; return render(); } main.innerHTML=viewEditor(); afterEditor(); }
     else if(S.tab==='scan'){ main.innerHTML=viewScan(); afterScan(); }
     else if(S.tab==='reports') main.innerHTML=viewReports();
+    else if(S.tab==='sap') main.innerHTML=viewSap();
     else { const x=extraView(S.tab); main.innerHTML=(x!=null?x:viewGuide()); afterExtra(S.tab); }
   }catch(err){ console.error(err); main.innerHTML='<div class="empty">This view could not be drawn: '+esc(err.message)+'</div>'; }
 }
@@ -631,13 +634,15 @@ function viewEditor(){
   const head='<div class="page-head"><h1>'+esc(title)+'</h1>'+navBtns+'</div>';
   if(pg&&!pg.manual){
     const tools='<div class="bar"><span>'+esc(pg.name)+' – page '+pg.pageNo+'</span><span class="tools"><button type="button" class="icon" data-act="zoomOut" aria-label="Zoom out" title="Zoom out">−</button><button type="button" class="icon" data-act="zoomFit" title="Fit to the panel">Fit</button><button type="button" class="icon" data-act="zoomIn" aria-label="Zoom in" title="Zoom in">+</button><button type="button" class="icon" data-act="viewRot" data-d="-90" aria-label="Turn left" title="Turn left">⟲</button><button type="button" class="icon" data-act="viewRot" data-d="90" aria-label="Turn right" title="Turn right">⟳</button></span></div>';
-    const img=pg.blob?'<img id="scanImg" style="width:'+Math.round((S.viewZoom||1)*100)+'%" alt="Scanned slip, page '+pg.pageNo+'">':'<div style="padding:14px"><p class="hint" style="margin:0 0 10px">The scan image for this page is not on this computer yet (it was read before images were kept). Choose the same PDF to bring it back; nothing is read again.</p><label class="btn ghost">Choose the PDF<input type="file" id="reattach" accept="application/pdf,.pdf,image/jpeg,image/png,image/webp" multiple class="sr-only"></label></div>';
+    const img=(pg.blob||pg.remoteImage)?'<img id="scanImg" style="width:'+Math.round((S.viewZoom||1)*100)+'%" alt="Scanned slip, page '+pg.pageNo+'">':'<div style="padding:14px"><p class="hint" style="margin:0 0 10px">The scan image for this page is not on this computer yet (it was read before images were kept). Choose the same PDF to bring it back; nothing is read again.</p><label class="btn ghost">Choose the PDF<input type="file" id="reattach" accept="application/pdf,.pdf,image/jpeg,image/png,image/webp" multiple class="sr-only"></label></div>';
     return '<section>'+head+'<div class="split"><figure class="scanview" id="scanview">'+tools+'<div class="imgbox">'+img+'</div></figure><div>'+form+'</div></div>'+datalists()+'</section>';
   }
   return '<section>'+head+form+datalists()+'</section>';
 }
 async function loadPreview(pg,imgId){
-  const img=$('#'+(imgId||'scanImg')); if(!pg||!img||!pg.blob) return;
+  const img=$('#'+(imgId||'scanImg')); if(!pg||!img) return;
+  if(!pg.blob&&pg.remoteImage&&typeof cloudBlob==='function') await cloudBlob(pg);
+  if(!pg.blob) return;
   if(!pg.preview){ try{ pg.preview=await blobToDataURL(await rotatedBlobDeg(pg,((pg.rot+(pg.aiRot||0)+(pg.viewRot||0))%360+360)%360)); }catch(err){} }
   if(pg.preview&&img.isConnected) img.src=pg.preview;
 }
@@ -935,6 +940,278 @@ function exportRows(rows,checks,stem,scope){
   S.downloads.save({filename:stem+'.xlsx',data:new Blob([buf])}).then(()=>toast('Excel file saved.')).catch(e=>{ const c=e&&e.code; if(c==='declined') return; toast(c==='rate_limited'?'A save is already waiting for you. Finish that one first.':'The file could not be saved in this view.'); });
 }
 
+/* ---------- SAP issue data → General Consumables reclass (engine) ---------- */
+function isoOf(v){
+  if(Object.prototype.toString.call(v)==='[object Date]'&&!isNaN(v)) return v.getFullYear()+'-'+String(v.getMonth()+1).padStart(2,'0')+'-'+String(v.getDate()).padStart(2,'0');
+  if(typeof v==='number'&&v>20000&&v<80000){ const d=new Date(Math.round((v-25569)*864e5)); return d.toISOString().slice(0,10); }
+  const s=String(v||'').trim(); let m=s.match(/^(\d{4})-(\d{2})-(\d{2})/); if(m) return m[0];
+  m=s.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})/); if(m) return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');
+  return '';
+}
+const numOf=v=>{ if(typeof v==='number') return v; const s=String(v==null?'':v).replace(/[, ]/g,'').replace(/^\((.*)\)$/,'-$1'); if(!s||s==='-') return 0; const n=Number(s); return isFinite(n)?n:0; };
+const docOf=v=>{ const s=String(v==null?'':v).replace(/\.0+$/,'').replace(/\D/g,''); return /^\d{6,12}$/.test(s)?s:''; };
+const r2=n=>Math.round((n+Number.EPSILON)*100)/100;
+/* aoa = rows of one sheet (arrays). Finds the header row and reads one record per SAP document line. */
+function parseSapAoa(aoa){
+  let hr=-1;
+  for(let i=0;i<Math.min(aoa.length,80);i++){ const r=(aoa[i]||[]).map(c=>String(c==null?'':c)); if(r.some(c=>/material doc/i.test(c))&&r.some(c=>/posting date/i.test(c))){ hr=i; break; } }
+  if(hr<0) return null;
+  const H=(aoa[hr]||[]).map(c=>String(c==null?'':c).trim());
+  const col=(re,not)=>H.findIndex(h=>re.test(h)&&!(not&&not.test(h)));
+  const C={doc:col(/material doc/i,/nos|count|lines|aed/i),date:col(/posting date/i),desc:col(/material description|^description/i),matNo:col(/^material(\s*no\.?|\s*number)?$/i),group:col(/material group/i),item:col(/doc(ument)?\s*item|^item$/i),
+    wbs:col(/wbs/i),qty:col(/issued qty|quantity|^qty/i),price:col(/unit price|^price/i),uom:col(/^unit$|^uom$|base unit|unit of measure/i),value:col(/issue value|^amount|line value|value \(aed\)/i,/all lines|g\/l|other/i),
+    je:col(/journal entry/i),status:col(/^status$/i),otherGl:col(/other g\/l aed/i),glDoc:col(/^gl aed|g\/l 51570000/i),allDoc:col(/all lines/i)};
+  if(C.doc<0||C.date<0||(C.value<0&&C.price<0)) return null;
+  const lines=[]; let cur=null, docLevel={};
+  for(let i=hr+1;i<aoa.length;i++){
+    const r=aoa[i]||[]; const doc=docOf(r[C.doc]); if(!doc) continue;
+    const g=k=>C[k]>=0?r[C[k]]:'';
+    if(doc!==cur){ cur=doc; docLevel={je:docOf(g('je')),status:String(g('status')||'').trim(),otherGl:numOf(g('otherGl')),glDoc:C.glDoc>=0?numOf(g('glDoc')):null,allDoc:C.allDoc>=0?numOf(g('allDoc')):null}; }
+    const date=isoOf(g('date')), qty=numOf(g('qty')), price=numOf(g('price')); let value=C.value>=0?numOf(g('value')):r2(qty*price);
+    lines.push({doc,item:numOf(g('item'))||lines.filter(x=>x.doc===doc).length+1,date,month:date.slice(0,7),desc:String(g('desc')||'').trim(),matNo:String(g('matNo')||'').replace(/\.0+$/,'').trim(),group:String(g('group')||'').trim(),
+      wbs:String(g('wbs')||'').trim(),qty,uom:String(g('uom')||'').trim(),price:price||(qty?r2(value/qty):0),value,je:docOf(g('je'))||docLevel.je,status:docLevel.status,otherGl:docLevel.otherGl,glDoc:docLevel.glDoc,allDoc:docLevel.allDoc});
+  }
+  return {lines,cols:Object.keys(C).filter(k=>C[k]>=0)};
+}
+const STAY='Stays in General Consumables';
+function wbsInfo(w){
+  const t=String(w||''); let m=t.match(/TSC-Villa-C([1-5])((?:-[0-9A-Z]+)+)/i);
+  if(m){ const segs=m[2].split('-').filter(Boolean), last=segs[segs.length-1], d=(last.match(/^\d+/)||[''])[0]; if(d) return {kind:'unit',key:'C'+m[1]+'-'+d.padStart(2,'0')+last.slice(d.length).toUpperCase()}; }
+  m=t.match(/Villa-Cluster\s*([1-5])|TSC-FMO-V-C([1-5])\)/i); if(m) return {kind:'cluster',key:'Cluster '+(m[1]||m[2])};
+  return null;
+}
+function unitKey(code){ const m=String(code||'').match(/^C([1-5])-(?:TH|GV|V)?(\d{1,3}[A-Z]?)/i); return m?'C'+m[1]+'-'+m[2].replace(/^(\d)(?!\d)/,'0$1').toUpperCase():''; }
+function placeOf(r){
+  if(r.unit) return {kind:'Unit',name:r.unit,group:'Residential Units',key:'U:'+unitKey(r.unit)};
+  if(r.loc&&r.loc!=='(not stated)') return {kind:'Location',name:r.loc,group:r.group||'Other',key:'L:'+r.loc.toLowerCase()};
+  return {kind:'Location',name:'Not written on the slip',group:'Not stated',key:'L:-'};
+}
+function mtoks(v){
+  const t=String(v||'').toLowerCase().replace(/["”']/g,' ').replace(/\b(\d)\s*1\/2\b/g,(m,a)=>String(+a+0.5)).replace(/\b(\d)1\/2\b/g,(m,a)=>String(+a+0.5)).replace(/\b1\/2\b/g,'0.5').replace(/\b3\/4\b/g,'0.75').replace(/\b1\/4\b/g,'0.25')
+    .replace(/[^a-z0-9.]+/g,' ').split(' ').filter(w=>w.length>1||/\d/.test(w));
+  return new Set(t.map(w=>/^[a-z]{5,}$/.test(w)?w.replace(/(es|s|e)$/,''):w));
+}
+function msim(a,b){ const A=mtoks(a),B=mtoks(b); if(!A.size||!B.size) return 0; let n=0; for(const x of A) if(B.has(x)) n++; return Math.max(n/(A.size+B.size-n),0.85*n/Math.min(A.size,B.size)*(Math.min(A.size,B.size)>=2?1:0.6)); }
+function matSim(desc,r){ const c=canon(desc); if(c&&c===r.material) return 1; return Math.max(msim(c,r.material),msim(desc,r.l.desc||''),msim(desc,r.material)); }
+function allocateSap(sap,rows,month){
+  const inM=sap.filter(l=>l.month===month);
+  const otherOnly=inM.filter(l=>/other g\/l only/i.test(l.status));
+  const keep=inM.filter(l=>!/other g\/l only/i.test(l.status));
+  const issued=rows.filter(r=>r.status==='Issued'&&/^\d{10}$/.test(r.doc));
+  const byDoc=new Map(); for(const r of issued){ if(!byDoc.has(r.doc)) byDoc.set(r.doc,[]); byDoc.get(r.doc).push({r,left:r.qty>0?r.qty:0}); }
+  const unitBy=new Map(); for(const r of rows) if(r.unit){ const k=unitKey(r.unit); if(k&&!unitBy.has(k)) unitBy.set(k,r.unit); }
+  const docs=new Map(); for(const l of keep){ if(!docs.has(l.doc)) docs.set(l.doc,[]); docs.get(l.doc).push(l); }
+  const alloc=[], exc=[];
+  // a SAP doc with no slip: look for a slip whose doc no. differs by one digit (or two swapped digits) and whose items are in this doc, not in its own
+  const allSap=new Map(); for(const l of sap){ if(!allSap.has(l.doc)) allSap.set(l.doc,[]); allSap.get(l.doc).push(l); }
+  const near=(a,b)=>{ if(a.length!==b.length) return false; const d=[]; for(let i=0;i<a.length;i++) if(a[i]!==b[i]) d.push(i); return d.length===1||(d.length===2&&d[1]===d[0]+1&&a[d[0]]===b[d[1]]&&a[d[1]]===b[d[0]]); };
+  const fits=(r,ls)=>(ls||[]).some(l=>matSim(l.desc,r)>=0.5);
+  for(const [doc,ls] of docs){
+    if(byDoc.has(doc)) continue;
+    for(const [sd,ents] of [...byDoc.entries()]){
+      if(!near(sd,doc)) continue;
+      const own=allSap.get(sd), move=ents.filter(x=>fits(x.r,ls)&&!fits(x.r,own));
+      if(!move.length) continue;
+      byDoc.set(doc,(byDoc.get(doc)||[]).concat(move.map(x=>Object.assign(x,{readAs:sd}))));
+      byDoc.set(sd,ents.filter(x=>!move.includes(x))); if(!byDoc.get(sd).length) byDoc.delete(sd);
+      exc.push({type:'Slip doc no. probably misread (linked)',doc,je:ls[0].je,date:ls[0].date,text:'Slip shows '+sd+' ('+(move[0].r.s.sourceRef||'')+'), but its items '+move.map(x=>x.r.material).join(', ')+' are in SAP doc '+doc+' – linked to '+doc+'; correct the doc no. on the slip',value:'',sid:move[0].r.s.id,li:move[0].r.i});
+    }
+  }
+  for(const [doc,ls] of docs){
+    const sl=byDoc.get(doc)||[], locs=[...new Map(sl.map(x=>{ const p=placeOf(x.r); return [p.key,p]; })).values()];
+    ls.sort((a,b)=>a.item-b.item);
+    for(const l of ls){
+      const q=l.qty>0?l.qty:1, parts=[]; let left=q;
+      const cands=sl.filter(x=>x.left>1e-9).map(x=>({x,s:matSim(l.desc,x.r)})).filter(c=>c.s>=0.34).sort((a,b)=>b.s-a.s);
+      let matched=0;
+      for(const c of cands){ if(left<=1e-9) break; const take=Math.min(left,c.x.left); c.x.left-=take; left-=take; matched+=take; parts.push({qty:take,place:placeOf(c.x.r),basis:c.x.readAs?'Slip line (doc no. on slip read as '+c.x.readAs+')':'Slip line (same doc no. and item)',slip:c.x.r}); }
+      if(left>1e-9){
+        const w=wbsInfo(l.wbs), stay=(name,basis,k)=>({qty:left,place:{kind:'Stays',name,group:STAY,key:'X:'+k},basis,slip:null});
+        if(locs.length===1){ parts.push({qty:left,place:locs[0],basis:matched?'One-location doc – SAP qty more than the slip shows':'One-location doc – item not on the slip',slip:null}); if(matched) exc.push({type:'SAP qty more than the slip shows',doc,je:l.je,date:l.date,text:l.desc+': SAP '+l.qty+', slip '+matched+' – all given to '+locs[0].name+' (only location on this doc no.)',value:r2(l.value*left/q)}); }
+        else if(w&&w.kind==='unit') parts.push({qty:left,place:{kind:'Unit',name:unitBy.get(w.key)||w.key+' (SAP WBS)',group:'Residential Units',key:'U:'+w.key},basis:sl.length?'SAP WBS unit (item not matched on the slip)':'SAP WBS unit – no slip found',slip:null});
+        else if(sl.length) parts.push(stay(matched?'SAP qty more than the slips show':'Item not on the scanned slips',matched?'Several locations on the slip; the extra qty cannot be placed':'Several locations on the slip; item not on it',matched?'q':'i'));
+        else parts.push(stay('No slip – '+(w&&w.kind==='cluster'?'SAP WBS '+w.key:l.wbs?'SAP WBS all clusters / other':'no WBS in SAP'),'No slip with this doc no.'+(w&&w.kind==='cluster'?' (SAP WBS: '+w.key+')':''),'n'+(w?w.key:l.wbs?'a':'0')));
+      }
+      let used=0;
+      parts.forEach((p,i)=>{ const v=i===parts.length-1?r2(l.value-used):r2(l.value*p.qty/q); used=r2(used+v);
+        alloc.push({month,je:l.je,doc,item:l.item,date:l.date,matNo:l.matNo,desc:l.desc,mgroup:l.group,wbs:l.wbs,sapQty:l.qty,uom:l.uom,price:l.price,lineValue:l.value,qty:r2(p.qty),value:v,
+          kind:p.place.kind,place:p.place.name,group:p.place.group,pkey:p.place.key,basis:p.basis,slipMat:p.slip?p.slip.material:'',slipSrc:p.slip?(p.slip.s.sourceRef||''):'',slipDate:p.slip?p.slip.date:'',sid:p.slip?p.slip.s.id:'',li:p.slip?p.slip.i:null,otherGl:l.otherGl}); });
+    }
+    for(const x of sl) if(x.left>1e-9) exc.push({type:x.left>=(x.r.qty||0)-1e-9?'Slip item not in the SAP document':'Slip qty more than SAP',doc,je:ls[0].je,date:ls[0].date,text:x.r.material+' × '+r2(x.left)+' on the slip ('+placeOf(x.r).name+')'+(x.left>=(x.r.qty||0)-1e-9?' – no matching SAP line in this doc no.':' – more than the SAP qty'),value:'',sid:x.r.s.id,li:x.r.i});
+    if(!sl.length){ const v=r2(ls.reduce((n,l)=>n+l.value,0)); exc.push({type:'SAP document with no slip',doc,je:ls[0].je,date:ls[0].date,text:ls.map(l=>l.desc+' × '+l.qty).join('; ')+(ls[0].wbs?' – WBS: '+ls[0].wbs:''),value:v}); }
+    if(ls[0].otherGl>0) exc.push({type:'Document partly posted to another G/L',doc,je:ls[0].je,date:ls[0].date,text:'AED '+r2(ls[0].otherGl)+' of this document went to another G/L – check which lines before the reclass',value:r2(ls[0].otherGl)});
+  }
+  const sapDocs=new Set(sap.map(l=>l.doc)), seen=new Set();
+  for(const r of issued) if(!sapDocs.has(r.doc)&&String(r.date||'').slice(0,7)===month&&!seen.has(r.doc)){ seen.add(r.doc); exc.push({type:'Slip doc no. not in the SAP data',doc:r.doc,je:'',date:r.date,text:'Slip doc no. '+r.doc+' ('+(r.s.sourceRef||'')+') is not in the SAP issue data – check the number or the month',value:'',sid:r.s.id,li:r.i}); }
+  const doneMonths=new Set(sap.map(l=>l.month));
+  for(const l of otherOnly) if(!seen.has('o'+l.doc)){ seen.add('o'+l.doc); exc.push({type:'Posted to another G/L only (left out)',doc:l.doc,je:l.je,date:l.date,text:'Not in G/L 51570000, so it is not part of the reclass',value:r2(otherOnly.filter(x=>x.doc===l.doc).reduce((n,x)=>n+x.value,0))}); }
+  return {alloc,exc,lines:keep,otherOnly,months:[...doneMonths].sort()};
+}
+function groupBy(arr,keyFn){ const m=new Map(); for(const x of arr){ const k=keyFn(x); if(!m.has(k)) m.set(k,[]); m.get(k).push(x); } return m; }
+function placeTotals(alloc){
+  return [...groupBy(alloc,a=>a.pkey).values()].map(as=>({kind:as[0].kind,place:as[0].place,group:as[0].group,pkey:as[0].pkey,docs:[...new Set(as.map(a=>a.doc))],jes:[...new Set(as.map(a=>a.je).filter(Boolean))],lines:as.length,value:r2(as.reduce((n,a)=>n+a.value,0)),
+    items:[...groupBy(as,a=>a.desc+'|'+a.price).values()].map(g=>g[0].desc+' × '+r2(g.reduce((n,a)=>n+a.qty,0))+' = '+r2(g.reduce((n,a)=>n+a.value,0)).toFixed(2)).join('; ')}))
+    .sort((a,b)=>a.kind.localeCompare(b.kind)||a.group.localeCompare(b.group)||a.place.localeCompare(b.place,undefined,{numeric:true}));
+}
+function groupTotals(alloc){
+  return [...groupBy(alloc,a=>a.group).entries()].map(([g,as])=>({group:g,kind:as[0].kind,places:new Set(as.map(a=>a.pkey)).size,docs:new Set(as.map(a=>a.doc)).size,lines:as.length,value:r2(as.reduce((n,a)=>n+a.value,0))}))
+    .sort((a,b)=>(a.group===STAY)-(b.group===STAY)||(a.group==='Residential Units'?-1:b.group==='Residential Units'?1:0)||b.value-a.value);
+}
+function reclassLines(alloc,map,src,month){
+  const out=[], ml=monthLabel(month);
+  let cr=0;
+  for(const g of groupTotals(alloc)){
+    const m=map[g.group]||{}; if(!m.gl||String(m.gl)===String(src)||!(g.value>0)) continue;
+    out.push({dc:'Debit',gl:m.gl,glName:m.name||'',costObj:m.cost||'',amount:g.value,group:g.group,text:ml+' stores issues reclass – '+g.group+' ('+g.docs+' material docs)'}); cr=r2(cr+g.value);
+  }
+  if(cr>0) out.push({dc:'Credit',gl:src,glName:'General Consumables',costObj:'',amount:cr,group:'',text:ml+' stores issues reclass out of General Consumables'});
+  return out;
+}
+
+/* ---------- SAP & G/L screen ---------- */
+function glMap(){ if(!S.glmap){ try{ S.glmap=JSON.parse(lsGet('sir.glmap')||'{}')||{}; }catch(e){ S.glmap={}; } } return S.glmap; }
+function glSrc(){ return S.glsrc||(S.glsrc=lsGet('sir.glsrc')||'51570000'); }
+function saveGlMap(){ lsSet('sir.glmap',JSON.stringify(glMap())); if(typeof CLOUD!=='undefined'&&CLOUD.on){ clearTimeout(S._glT); S._glT=setTimeout(()=>cloudSaveSetting('glmap',glMap()),800); } }
+function sapMonths(){ return S.sap?[...new Set(S.sap.lines.map(l=>l.month).filter(Boolean))].sort():[]; }
+function sapSlipRows(){ const ps=batchPages(); return flatten(ps.length?slipsOf(ps):[...S.slips.values()]); }
+function sapResult(){
+  const ms=sapMonths(); if(!ms.length) return null;
+  if(!S.sapM||(S.sapM!=='all'&&!ms.includes(S.sapM))) S.sapM=ms[ms.length-1];
+  const rows=sapSlipRows(), list=S.sapM==='all'?ms:[S.sapM];
+  const parts=list.map(m=>allocateSap(S.sap.lines,rows,m));
+  return {months:list,alloc:parts.flatMap(p=>p.alloc),exc:parts.flatMap(p=>p.exc),lines:parts.flatMap(p=>p.lines),otherOnly:parts.flatMap(p=>p.otherOnly),rows};
+}
+const aed=v=>(Math.round((+v||0)*100)/100).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2});
+function targetOf(group){ const m=glMap()[group]||{}; return m.gl&&String(m.gl)!==String(glSrc())?m:null; }
+function sapJournal(res){ return res.months.flatMap(m=>reclassLines(res.alloc.filter(a=>a.month===m),glMap(),glSrc(),m).map(l=>Object.assign({month:m},l))); }
+function sapFilter(list,fields){ const t=termsOf(S.sapQ); return t.length?list.filter(x=>matchText(fields(x),t)):list; }
+function viewSap(){
+  const has=!!(S.sap&&S.sap.lines.length);
+  let h='<h1>SAP &amp; G/L</h1><p class="lede">Links the stores issues that SAP posted to General Consumables (G/L '+esc(glSrc())+') with the slips: every material document and G/L journal entry, its value, and the unit or location it went to. For each month it gives the summary, the detail and the journal to move the amounts to the right G/L accounts.</p>';
+  h+='<div class="card" style="padding:14px 16px;margin:0 0 14px">'+(has
+    ?'<p style="margin:0 0 8px"><b>SAP issue data loaded:</b> '+esc(S.sap.file||'')+' – '+S.sap.lines.length.toLocaleString('en-GB')+' lines, '+new Set(S.sap.lines.map(l=>l.doc)).size.toLocaleString('en-GB')+' material documents, '+sapMonths().map(monthLabel).join(', ')+'.</p><p class="hint" style="margin:0">Load a newer file to add or replace months: documents in the new file replace the same documents here. <label class="link" style="cursor:pointer">Load a file<input type="file" id="sapFile" accept=".xlsx,.xls,.csv" class="sr-only"></label> · <button type="button" class="link" data-act="sapClear">Remove the SAP data</button></p>'
+    :'<p style="margin:0 0 8px"><b>Load the SAP issue data (Excel).</b> One row per material document line with these columns: Material Doc No, Posting Date, Material Description, Issued Qty, Unit Price, Issue Value, GL Journal Entry and WBS Element (Material No, Material Group, Status and Other G/L AED are used when present). Your sheet “GL Report Data” has this layout; the app finds the header row by itself.</p><label class="btn">Choose the SAP Excel file<input type="file" id="sapFile" accept=".xlsx,.xls,.csv" class="sr-only"></label>')+'</div>';
+  if(!has) return h;
+  const res=sapResult(); if(!res) return h+'<div class="empty">The SAP file has no posting dates.</div>';
+  const ms=sapMonths(), v=S.sapView||'summary';
+  h+='<div class="filters"><label>Month (SAP posting date)<select id="sapMonth"><option value="all"'+(S.sapM==='all'?' selected':'')+'>All months</option>'+ms.map(m=>'<option value="'+m+'"'+(S.sapM===m?' selected':'')+'>'+esc(monthLabel(m))+'</option>').join('')+'</select></label>'+
+    '<label>G/L to clear<input id="glsrc" value="'+esc(glSrc())+'" style="width:120px"></label>'+
+    '<label>Search<input type="search" id="sapq" value="'+esc(S.sapQ||'')+'" placeholder="Unit, location, doc no., JE, item"></label>'+
+    '<button type="button" class="btn" data-act="sapExcel"'+(window.XLSX&&S.downloads?'':' disabled')+'>Download Excel</button></div>';
+  const tabs=[['summary','Summary'],['journal','Reclass journal'],['units','By unit'],['locs','By location'],['detail','Detail'],['exc','Exceptions ('+res.exc.length+')'],['map','G/L mapping']];
+  h+='<div class="subtabs" role="group" aria-label="SAP report">'+tabs.map(([k,l])=>'<button type="button" data-act="sapView" data-v="'+k+'" aria-pressed="'+(v===k)+'">'+esc(l)+'</button>').join('')+'</div>';
+  return h+'<div id="sapBody">'+sapBody(v,res)+'</div>';
+}
+function sapBody(v,res){
+  const A=res.alloc, tot=r2(A.reduce((n,a)=>n+a.value,0)), sum=f=>r2(A.filter(f).reduce((n,a)=>n+a.value,0));
+  const units=sum(a=>a.kind==='Unit'), locs=sum(a=>a.kind==='Location'&&a.group!=='Not stated'), notst=sum(a=>a.group==='Not stated'), stay=sum(a=>a.kind==='Stays');
+  const jr=sapJournal(res), reclass=r2(jr.filter(l=>l.dc==='Credit').reduce((n,l)=>n+l.amount,0));
+  const docs=new Set(res.lines.map(l=>l.doc)), withSlip=new Set(A.filter(a=>a.sid).map(a=>a.doc));
+  if(v==='summary'){
+    const gl=r2([...groupBy(res.lines,l=>l.doc).values()].reduce((n,ls)=>n+(ls[0].glDoc!=null?ls[0].glDoc:0),0)), hasGl=res.lines.some(l=>l.glDoc!=null);
+    const gt=groupTotals(A);
+    let h='<div class="kv2"><div><span>SAP issues to G/L '+esc(glSrc())+'</span>AED '+aed(tot)+'<br><span>'+res.lines.length+' lines, '+docs.size+' material docs, '+new Set(res.lines.map(l=>l.je).filter(Boolean)).size+' G/L JEs</span></div><div><span>On residential units</span>AED '+aed(units)+'</div><div><span>On other locations</span>AED '+aed(locs)+'</div><div><span>Slip without a location</span>AED '+aed(notst)+'</div><div><span>Stays in General Consumables</span>AED '+aed(stay)+'<br><span>no slip, or more than the slips show</span></div><div><span>Ready to reclass (target G/L set)</span>AED '+aed(reclass)+'</div><div><span>Material docs with a scanned slip</span>'+withSlip.size+' of '+docs.size+'</div><div><span>Other G/L only (left out)</span>AED '+aed(res.otherOnly.reduce((n,l)=>n+l.value,0))+'</div>'+(hasGl?'<div><span>G/L '+esc(glSrc())+' per G/L report</span>AED '+aed(gl)+(Math.abs(gl-tot)>0.01?' <span style="color:var(--stamp)">(difference '+aed(gl-tot)+')</span>':' ✓')+'</div>':'')+'</div>';
+    h+='<div class="tbl"><table class="data"><thead><tr><th>Where it went</th><th class="num">Units / places</th><th class="num">Material docs</th><th class="num">Lines</th><th class="num">AED</th><th class="num">%</th><th>Target G/L</th></tr></thead><tbody>'+
+      gt.map(g=>{ const t=targetOf(g.group); return '<tr><td>'+esc(g.group)+'</td><td class="num">'+g.places+'</td><td class="num">'+g.docs+'</td><td class="num">'+g.lines+'</td><td class="num">'+aed(g.value)+'</td><td class="num">'+(tot?Math.round(1000*g.value/tot)/10:0)+'</td><td>'+(g.group===STAY?'<span class="hint">stays</span>':t?esc(t.gl+(t.name?' – '+t.name:'')):'<button type="button" class="link" data-act="sapView" data-v="map">set the G/L</button>')+'</td></tr>'; }).join('')+
+      '<tr><td><b>Total</b></td><td></td><td class="num"><b>'+docs.size+'</b></td><td class="num"><b>'+A.length+'</b></td><td class="num"><b>'+aed(tot)+'</b></td><td class="num">100</td><td></td></tr></tbody></table></div>';
+    if(res.months.length>1){
+      h+='<h2>By month</h2><div class="tbl"><table class="data"><thead><tr><th>Month</th><th class="num">SAP to G/L</th><th class="num">Units</th><th class="num">Other locations</th><th class="num">No location</th><th class="num">Stays</th><th class="num">Reclass ready</th><th class="num">Docs with slip</th></tr></thead><tbody>'+
+        res.months.map(m=>{ const a=A.filter(x=>x.month===m), s=f=>aed(a.filter(f).reduce((n,x)=>n+x.value,0)), rc=jr.filter(l=>l.month===m&&l.dc==='Credit').reduce((n,l)=>n+l.amount,0), d=new Set(a.map(x=>x.doc)), ws=new Set(a.filter(x=>x.sid).map(x=>x.doc));
+          return '<tr><td>'+esc(monthLabel(m))+'</td><td class="num">'+s(()=>true)+'</td><td class="num">'+s(x=>x.kind==='Unit')+'</td><td class="num">'+s(x=>x.kind==='Location'&&x.group!=='Not stated')+'</td><td class="num">'+s(x=>x.group==='Not stated')+'</td><td class="num">'+s(x=>x.kind==='Stays')+'</td><td class="num">'+aed(rc)+'</td><td class="num">'+ws.size+' of '+d.size+'</td></tr>'; }).join('')+'</tbody></table></div>';
+    }
+    return h+'<p class="hint">Values come from SAP (issue value of each material document line). The slip decides where a line went: same doc no. and the same item; a doc with only one location on its slip goes there in full; a unit in the SAP WBS element is used when the slip does not place the line. What cannot be placed stays in General Consumables and is listed under Exceptions.</p>';
+  }
+  if(v==='journal'){
+    const missing=groupTotals(A).filter(g=>g.group!==STAY&&!targetOf(g.group)&&g.value>0);
+    let h='<p class="lede">Proposed journal'+(res.months.length>1?'s, one per month,':'')+' to move the placed amounts out of G/L '+esc(glSrc())+'. Support: the Excel report (Reclass by unit-location and Detail sheets).</p>';
+    if(!jr.length) h+='<div class="empty">No target G/L is set yet. <button type="button" class="link" data-act="sapView" data-v="map">Set the G/L accounts</button></div>';
+    else h+='<div class="tbl"><table class="data"><thead><tr><th>Month</th><th>Dr / Cr</th><th>G/L</th><th>G/L name</th><th>Cost object / WBS</th><th class="num">Amount AED</th><th>Line text</th></tr></thead><tbody>'+jr.map(l=>'<tr'+(l.dc==='Credit'?' style="font-weight:600"':'')+'><td>'+esc(monthLabel(l.month))+'</td><td>'+l.dc+'</td><td>'+esc(l.gl)+'</td><td>'+esc(l.glName)+'</td><td>'+esc(l.costObj)+'</td><td class="num">'+aed(l.amount)+'</td><td class="wrap">'+esc(l.text)+'</td></tr>').join('')+'</tbody></table></div>';
+    if(missing.length) h+='<p class="hint">Not in the journal because no target G/L is set: '+missing.map(g=>esc(g.group)+' (AED '+aed(g.value)+')').join(', ')+'. <button type="button" class="link" data-act="sapView" data-v="map">Set them</button></p>';
+    return h;
+  }
+  if(v==='units'||v==='locs'){
+    const pt=sapFilter(placeTotals(A).filter(p=>v==='units'?p.kind==='Unit':p.kind!=='Unit'),p=>[p.place,p.group,p.docs.join(' '),p.jes.join(' '),p.items].join(' '));
+    if(!pt.length) return '<div class="empty">Nothing to show'+(S.sapQ?' for this search':'')+'.</div>';
+    return '<p class="lede">'+pl(pt.length,v==='units'?'unit':'place')+', AED '+aed(pt.reduce((n,p)=>n+p.value,0))+'.</p><div class="tbl"><table class="data"><thead><tr><th>'+(v==='units'?'Unit':'Location')+'</th>'+(v==='locs'?'<th>Group</th>':'')+'<th>Material docs</th><th>G/L JEs</th><th>Items (SAP qty = AED)</th><th class="num">AED</th><th>Target G/L</th></tr></thead><tbody>'+
+      pt.map(p=>{ const t=targetOf(p.group); return '<tr><td><b>'+esc(p.place)+'</b></td>'+(v==='locs'?'<td>'+esc(p.group)+'</td>':'')+'<td class="wrap">'+esc(p.docs.join(', '))+'</td><td class="wrap">'+esc(p.jes.join(', '))+'</td><td class="wrap">'+esc(p.items)+'</td><td class="num">'+aed(p.value)+'</td><td>'+(p.group===STAY?'<span class="hint">stays</span>':t?esc(t.gl):'<span class="hint">not set</span>')+'</td></tr>'; }).join('')+'</tbody></table></div>';
+  }
+  if(v==='detail'){
+    const d=sapFilter(A,a=>[a.je,a.doc,a.desc,a.place,a.group,a.basis,a.slipMat,a.slipSrc,fmtDate(a.date)].join(' ')), shown=d.slice(0,1500);
+    return '<p class="lede">'+pl(d.length,'line')+', AED '+aed(d.reduce((n,a)=>n+a.value,0))+'. One row per SAP line and place; a line split between places shows on several rows.</p><div class="tbl"><table class="data"><thead><tr>'+ACT_TH+'<th>G/L JE</th><th>Material doc</th><th>Posting date</th><th>SAP item</th><th class="num">SAP qty</th><th class="num">Price</th><th class="num">Qty placed</th><th class="num">AED</th><th>Unit / location</th><th>Group</th><th>How it was placed</th><th>Slip</th></tr></thead><tbody>'+
+      shown.map(a=>'<tr>'+(a.sid?actCell(a.sid,a.li):'<td></td>')+'<td>'+esc(a.je)+'</td><td class="doc">'+esc(a.doc)+'</td><td>'+esc(fmtDate(a.date))+'</td><td class="wrap">'+esc(a.desc)+'</td><td class="num">'+nf(a.sapQty)+'</td><td class="num">'+aed(a.price)+'</td><td class="num">'+nf(a.qty)+'</td><td class="num">'+aed(a.value)+'</td><td><b>'+esc(a.place)+'</b></td><td>'+esc(a.group)+'</td><td class="wrap">'+esc(a.basis)+'</td><td class="wrap">'+esc(a.slipMat?a.slipMat+' – '+a.slipSrc:'')+'</td></tr>').join('')+'</tbody></table></div>'+(d.length>shown.length?'<p class="hint">Showing the first '+shown.length+'. The Excel file has all of them.</p>':'');
+  }
+  if(v==='exc'){
+    const e=sapFilter(res.exc,x=>[x.type,x.doc,x.je,x.text].join(' ')), types=[...groupBy(e,x=>x.type).entries()];
+    if(!e.length) return '<div class="empty">No exceptions.</div>';
+    return '<p class="lede">'+types.map(([t,xs])=>xs.length+' × '+esc(t.toLowerCase())).join(', ')+'.</p><div class="tbl"><table class="data"><thead><tr>'+ACT_TH+'<th>Exception</th><th>Material doc</th><th>G/L JE</th><th>Date</th><th>Details</th><th class="num">AED</th></tr></thead><tbody>'+
+      e.map(x=>'<tr>'+(x.sid?actCell(x.sid,x.li):'<td></td>')+'<td>'+esc(x.type)+'</td><td class="doc">'+esc(x.doc)+'</td><td>'+esc(x.je||'')+'</td><td>'+esc(fmtDate(x.date))+'</td><td class="wrap">'+esc(x.text)+'</td><td class="num">'+(x.value===''?'':aed(x.value))+'</td></tr>').join('')+'</tbody></table></div>';
+  }
+  // G/L mapping
+  const gt=groupTotals(A).filter(g=>g.group!==STAY), known=new Set(gt.map(g=>g.group)); for(const k of Object.keys(glMap())) if(!known.has(k)&&k!==STAY) gt.push({group:k,value:0});
+  return '<p class="lede">Choose the G/L account each group of issues should move to. Leave the G/L empty to keep the amount in General Consumables. This is saved on this computer and used for every month.</p><div class="tbl"><table class="data"><thead><tr><th>Group</th><th class="num">AED this view</th><th>Target G/L</th><th>G/L name</th><th>Cost object / WBS (optional)</th></tr></thead><tbody>'+
+    gt.map(g=>{ const m=glMap()[g.group]||{}; return '<tr><td>'+esc(g.group)+'</td><td class="num">'+aed(g.value)+'</td><td><input data-glg="'+esc(g.group)+'" data-k="gl" value="'+esc(m.gl||'')+'" inputmode="numeric" style="width:120px" aria-label="Target G/L for '+esc(g.group)+'"></td><td><input data-glg="'+esc(g.group)+'" data-k="name" value="'+esc(m.name||'')+'" style="width:220px" aria-label="G/L name for '+esc(g.group)+'"></td><td><input data-glg="'+esc(g.group)+'" data-k="cost" value="'+esc(m.cost||'')+'" style="width:180px" aria-label="Cost object for '+esc(g.group)+'"></td></tr>'; }).join('')+'</tbody></table></div>';
+}
+function sapExcel(){
+  const X=window.XLSX; if(!X||!S.downloads){ toast('Saving files is not available in this view.'); return; }
+  const res=sapResult(); if(!res) return;
+  const wb=X.utils.book_new(), add=(name,head,rows,widths,dates,money)=>{ const ws=X.utils.aoa_to_sheet([head,...rows]); ws['!cols']=(widths||head.map(()=>14)).map(w=>({wch:w}));
+    for(let R=1;R<=rows.length;R++){ for(const c of (dates||[])){ const x=ws[X.utils.encode_cell({r:R,c})]; if(x&&typeof x.v==='number') x.z='dd/mm/yyyy'; } for(const c of (money||[])){ const x=ws[X.utils.encode_cell({r:R,c})]; if(x&&typeof x.v==='number') x.z='#,##0.00'; } }
+    if(rows.length&&name!=='Summary') ws['!autofilter']={ref:ws['!ref']};
+    X.utils.book_append_sheet(wb,ws,name.replace(/[:\\\/?*\[\]]/g,'-').slice(0,31)); };
+  const A=res.alloc, jr=sapJournal(res), lab=res.months.length>1?'All months':monthLabel(res.months[0]), d=v=>xlSerial(v);
+  const tot=r2(A.reduce((n,a)=>n+a.value,0)), sum=f=>r2(A.filter(f).reduce((n,a)=>n+a.value,0));
+  add('Summary',['Item','AED','Note'],[
+    ['Period (SAP posting date)',lab,''],['G/L being cleared',glSrc(),'General Consumables'],['SAP issue lines in this G/L',tot,res.lines.length+' lines, '+new Set(res.lines.map(l=>l.doc)).size+' material docs'],
+    ['Placed on residential units',sum(a=>a.kind==='Unit'),''],['Placed on other locations',sum(a=>a.kind==='Location'&&a.group!=='Not stated'),''],['Slip without a location',sum(a=>a.group==='Not stated'),''],
+    ['Stays in General Consumables',sum(a=>a.kind==='Stays'),'No slip, or more than the slips show – see Exceptions'],['Ready to reclass (target G/L set)',r2(jr.filter(l=>l.dc==='Credit').reduce((n,l)=>n+l.amount,0)),'See Reclass Journal'],
+    ['Posted to another G/L only (left out)',r2(res.otherOnly.reduce((n,l)=>n+l.value,0)),'Not in '+glSrc()],[],['Where it went','AED','Material docs'],
+    ...groupTotals(A).map(g=>[g.group,g.value,g.docs+' material docs']),[],['Month','SAP to G/L','Units','Other locations','No location','Stays','Reclass ready'],
+    ...res.months.map(m=>{ const a=A.filter(x=>x.month===m), s=f=>r2(a.filter(f).reduce((n,x)=>n+x.value,0)); return [monthLabel(m),s(()=>true),s(x=>x.kind==='Unit'),s(x=>x.kind==='Location'&&x.group!=='Not stated'),s(x=>x.group==='Not stated'),s(x=>x.kind==='Stays'),r2(jr.filter(l=>l.month===m&&l.dc==='Credit').reduce((n,l)=>n+l.amount,0))]; })],[38,16,16,16,14,14,14],[],[1,2,3,4,5,6]);
+  add('Reclass Journal',['Month','Dr / Cr','G/L','G/L name','Cost object / WBS','Debit AED','Credit AED','Line text'],jr.map(l=>[monthLabel(l.month),l.dc,l.gl,l.glName,l.costObj,l.dc==='Debit'?l.amount:'',l.dc==='Credit'?l.amount:'',l.text]),[10,8,12,28,20,14,14,60],[],[5,6]);
+  const byMonthPlace=res.months.flatMap(m=>placeTotals(A.filter(a=>a.month===m)).map(p=>Object.assign({month:m},p)));
+  add('Reclass by Unit-Location',['Month','Type','Unit / location','Group','Target G/L','G/L name','Cost object / WBS','AED','Material docs','G/L JEs','Items (SAP qty = AED)'],
+    byMonthPlace.map(p=>{ const t=targetOf(p.group); return [monthLabel(p.month),p.kind==='Stays'?'Stays':p.kind,p.place,p.group,t?t.gl:'',t?t.name||'':'',t?t.cost||'':'',p.value,p.docs.join(', '),p.jes.join(', '),p.items]; }),[10,9,30,24,12,24,18,12,40,40,80],[],[7]);
+  const pt=placeTotals(A);
+  add('By Unit',['Unit','Material docs','G/L JEs','Items (SAP qty = AED)','AED'],pt.filter(p=>p.kind==='Unit').map(p=>[p.place,p.docs.join(', '),p.jes.join(', '),p.items,p.value]),[18,40,40,90,12],[],[4]);
+  add('By Location',['Location','Group','Material docs','G/L JEs','Items (SAP qty = AED)','AED'],pt.filter(p=>p.kind!=='Unit').map(p=>[p.place,p.group,p.docs.join(', '),p.jes.join(', '),p.items,p.value]),[34,26,40,40,90,12],[],[5]);
+  add('Detail',['Month','G/L JE','Material doc','Posting date','Doc item','Material no.','SAP item','Material group','WBS element','SAP qty','UoM','Unit price','SAP line AED','Qty placed','AED placed','Type','Unit / location','Group','Target G/L','How it was placed','Slip item','Slip date','Slip source'],
+    A.map(a=>{ const t=targetOf(a.group); return [monthLabel(a.month),a.je,a.doc,d(a.date),a.item,a.matNo,a.desc,a.mgroup,a.wbs,a.sapQty,a.uom,a.price,a.lineValue,a.qty,a.value,a.kind,a.place,a.group,t?t.gl:'',a.basis,a.slipMat,d(a.slipDate),a.slipSrc]; }),[9,13,13,12,6,11,34,20,34,8,6,10,11,9,11,9,28,24,11,40,30,12,34],[3,21],[11,12,14]);
+  add('Exceptions',['Exception','Material doc','G/L JE','Date','Details','AED'],res.exc.map(x=>[x.type,x.doc,x.je||'',d(x.date),x.text,x.value===''?'':x.value]),[34,14,14,12,100,12],[3],[5]);
+  add('GL Mapping',['Group','Target G/L','G/L name','Cost object / WBS'],Object.entries(glMap()).map(([g,m])=>[g,m.gl||'',m.name||'',m.cost||'']),[30,14,30,22]);
+  add('SAP Lines',['Material doc','Doc item','Posting date','Material no.','Material description','Material group','WBS element','Qty','UoM','Unit price','Issue value','G/L JE','Status'],
+    res.lines.concat(res.otherOnly).map(l=>[l.doc,l.item,d(l.date),l.matNo,l.desc,l.group,l.wbs,l.qty,l.uom,l.price,l.value,l.je,l.status]),[13,6,12,11,34,20,34,8,6,10,11,13,18],[2],[9,10]);
+  const buf=X.write(wb,{bookType:'xlsx',type:'array'}), name='General_Consumables_Reclass_'+(res.months.length>1?'All_months':res.months[0])+'.xlsx';
+  S.downloads.save({filename:name,data:new Blob([buf])}).then(()=>toast('Excel file saved.')).catch(e=>{ if(e&&e.code!=='declined') toast('The file could not be saved.'); });
+}
+async function loadSapFile(f){
+  if(!window.XLSX){ toast('The Excel library did not load.'); return; }
+  toast('Reading '+f.name+'…');
+  try{
+    const wb=window.XLSX.read(new Uint8Array(await f.arrayBuffer()),{type:'array',cellDates:true}); let best=null, sheet='';
+    for(const n of wb.SheetNames){ const p=parseSapAoa(window.XLSX.utils.sheet_to_json(wb.Sheets[n],{header:1,raw:true,defval:''})); if(p&&p.lines.length&&(!best||p.lines.length>best.lines.length)){ best=p; sheet=n; } }
+    if(!best){ toast('No sheet with Material Doc No and Posting Date columns was found in this file.'); return; }
+    const docs=new Set(best.lines.map(l=>l.doc)), keep=S.sap?S.sap.lines.filter(l=>!docs.has(l.doc)):[];
+    S.sap={lines:keep.concat(best.lines),file:f.name+' (sheet '+sheet+')',at:new Date().toISOString()};
+    await saveSapData(S.sap); S.sapM=''; toast('SAP data loaded: '+best.lines.length.toLocaleString('en-GB')+' lines from sheet “'+sheet+'”.'); render();
+  }catch(e){ toast('The file could not be read: '+((e&&e.message)||'unknown error')); }
+}
+function sapAct(a){
+  const k=a.dataset.act;
+  if(k==='sapView'){ S.sapView=a.dataset.v; render(); return true; }
+  if(k==='sapExcel'){ sapExcel(); return true; }
+  if(k==='sapClear'){ if(armed(a,'Click again to remove the SAP data')){ S.sap=null; saveSapData(null); render(); } return true; }
+  return false;
+}
+let sapDeb=0;
+function sapInput(t,type){
+  if(t.id==='sapFile'&&type==='change'){ const f=t.files&&t.files[0]; if(f) loadSapFile(f); return true; }
+  if(t.id==='sapMonth'&&type==='change'){ S.sapM=t.value; render(); return true; }
+  if(t.id==='glsrc'&&type==='change'){ S.glsrc=t.value.trim()||'51570000'; lsSet('sir.glsrc',S.glsrc); if(typeof CLOUD!=='undefined'&&CLOUD.on) cloudSaveSetting('glsrc',S.glsrc); render(); return true; }
+  if(t.id==='sapq'&&type==='input'){ clearTimeout(sapDeb); sapDeb=setTimeout(()=>{ S.sapQ=t.value; const pos=t.selectionStart; const b=$('#sapBody'); if(b) b.innerHTML=sapBody(S.sapView||'summary',sapResult()); const n=$('#sapq'); if(n){ n.focus(); try{ n.setSelectionRange(pos,pos); }catch(e){} } },250); return true; }
+  if(t.dataset&&t.dataset.glg){ const m=glMap(), g=t.dataset.glg; m[g]=Object.assign({},m[g],{[t.dataset.k]:t.value.trim()}); saveGlMap(); return true; }
+  return false;
+}
+
 /* ---------- scan to report ---------- */
 const READ_PROMPT=`You are reading ONE scanned store slip ("Material Issue Slip", "Key-Issue Slip" or a SANAD slip) from The Sustainable City facility stores in Dubai. The scan may be rotated: read it in whichever orientation makes the text upright. Read EVERY detail on the page.
 
@@ -1128,17 +1405,18 @@ function pageCardHTML(p){
   const st={new:'Waiting',reading:'Reading…',read:chk?'Read – check it':p.checked?'Checked':'Read',saved:'In register',error:'Could not read'}[p.status]||p.status;
   const chip=p.status==='saved'?'ok':p.status==='read'?(chk?'pending':'pen'):p.status==='error'?'flag':'';
   const rot=((p.rot+(p.aiRot||0))%360), ai=canRead()&&!S.scan.running;
-  return '<li class="pg"><div class="thumb">'+(p.thumb?'<img src="'+p.thumb+'" alt="Page '+p.pageNo+' of '+esc(p.name)+'" style="transform:rotate('+rot+'deg)">':'<span class="hint" style="padding:10px;text-align:center">'+(p.manual?'Typed slip':'Drop the PDF again to see this page')+'</span>')+'</div>'+
+  return '<li class="pg"><div class="thumb">'+(p.thumb?'<img src="'+p.thumb+'" alt="Page '+p.pageNo+' of '+esc(p.name)+'" style="transform:rotate('+rot+'deg)">':'<span class="hint" style="padding:10px;text-align:center">'+(p.manual?'Typed slip':p.remoteImage?'Loading the scan…':'Drop the PDF again to see this page')+'</span>')+'</div>'+
    '<div class="meta"><span>'+esc(shortName(p.name))+' p'+p.pageNo+'</span><span class="chip '+chip+'">'+st+'</span></div>'+(p.error?'<div class="err">'+esc(p.error)+'</div>':'')+
    '<div class="row">'+(p.draft?'<button type="button" class="btn ghost" data-act="review" data-id="'+p.id+'">Edit</button><button type="button" class="link" data-act="preview" data-sid="'+esc(p.draft.id)+'">Preview</button>':'')+
-   ((p.status==='new'||p.status==='error')&&ai&&p.blob?'<button type="button" class="btn ghost" data-act="readPage" data-id="'+p.id+'">Read</button>':'')+
-   (p.draft&&ai&&p.blob?'<button type="button" class="link" data-act="readPage" data-id="'+p.id+'" data-again="1">Read again</button>':'')+
+   ((p.status==='new'||p.status==='error')&&ai&&(p.blob||p.remoteImage)?'<button type="button" class="btn ghost" data-act="readPage" data-id="'+p.id+'">Read</button>':'')+
+   (p.draft&&ai&&(p.blob||p.remoteImage)?'<button type="button" class="link" data-act="readPage" data-id="'+p.id+'" data-again="1">Read again</button>':'')+
    '<button type="button" class="icon" data-act="rot" data-id="'+p.id+'" data-d="-90" aria-label="Rotate left" title="Rotate left">⟲</button><button type="button" class="icon" data-act="rot" data-id="'+p.id+'" data-d="90" aria-label="Rotate right" title="Rotate right">⟳</button>'+
    (p.status!=='reading'?'<button type="button" class="link" data-act="removePage" data-id="'+p.id+'">Remove</button>':'')+'</div></li>';
 }
 let scanT=0, scanAt=0;
 function refreshScan(force){
   if(S.tab!=='scan') return;
+  if(force&&S.scan.view==='pages'&&typeof cloudThumbs==='function') setTimeout(cloudThumbs,0);
   const bar=$('#scanBar'), rep=$('#scanRep'); if(!bar||!rep){ render(); return; }
   bar.innerHTML=scanBarHTML();
   const now=Date.now();
@@ -1150,6 +1428,7 @@ function refreshScan(force){
 }
 function updateScanList(){ refreshScan(false); }
 function afterScan(){
+  if(typeof cloudThumbs==='function') setTimeout(cloudThumbs,0);
   const d=$('#drop'); if(!d) return;
   d.addEventListener('dragover',e=>{ e.preventDefault(); d.classList.add('over'); });
   d.addEventListener('dragleave',()=>d.classList.remove('over'));
@@ -1210,7 +1489,7 @@ async function addFiles(files){
   let restored=0;
   for(const f of files){
     const fk=hash36(f.name+'|'+f.size);
-    if(S.scan.pages.some(p=>p.fileKey===fk&&p.blob)){ toast(f.name+' is already on the list.'); continue; }
+    if(S.scan.pages.some(p=>p.fileKey===fk&&(p.blob||p.remoteImage))){ toast(f.name+' is already on the list.'); continue; }
     try{
       if(/pdf$/i.test(f.type)||/\.pdf$/i.test(f.name)) await addPdf(f,fk); else if(/^image\//.test(f.type)) await addImage(f,fk); else { toast(f.name+' is not a PDF or an image.'); continue; }
       restored+=await restoreReads(fk);
@@ -1290,6 +1569,7 @@ async function readImages(pg,noCache){
 }
 async function readOne(pg,again){
   if(!canRead()||!pg||pg.status==='reading') return;
+  if(!pg.blob&&pg.remoteImage&&typeof cloudBlob==='function') await cloudBlob(pg);
   if(!pg.blob){ pg.error='Drop the same PDF again to read this page.'; refreshScan(false); return; }
   pg.status='reading'; pg.error=''; refreshScan(false);
   try{
@@ -1344,7 +1624,7 @@ function editorReady(d){
 }
 function openScanReview(pg,li){
   if(!pg||!pg.draft) return; if(S.tab==='new') pullEditor();
-  S.editor=editorReady(JSON.parse(JSON.stringify(pg.draft))); S.editor.fromScan=pg.id; S.editor._mode='scan'; S.editorDirty=false; S.from='scan'; S.hlLine=li==null?null:li; S.tab='edit'; render(); window.scrollTo(0,0);
+  S.editor=editorReady(JSON.parse(JSON.stringify(pg.draft))); S.editor.fromScan=pg.id; S.editor._mode='scan'; S.editorDirty=false; S.from=S.tab==='sap'?'sap':'scan'; S.hlLine=li==null?null:li; S.tab='edit'; render(); window.scrollTo(0,0);
 }
 function nextToCheck(cur){
   const ps=S.scan.pages, i=ps.indexOf(cur), order=ps.slice(i+1).concat(ps.slice(0,Math.max(i,0)));
@@ -1447,17 +1727,17 @@ function accuracyHTML(q){
 function monthsHTML(q){
   const groups=pageMonths().map(([m,ps])=>[m,q?ps.filter(p=>pageMatches(p,q)):ps]).filter(([m,ps])=>ps.length), lib=!!window.JSZip;
   const rowsH=groups.map(([m,ps])=>{
-    const read=ps.filter(p=>p.draft), imgs=ps.filter(p=>p.blob).length, chk=read.filter(p=>pageNeedsCheck(p)&&!p.checked).length;
+    const read=ps.filter(p=>p.draft), imgs=ps.filter(p=>p.blob||p.remoteImage).length, chk=read.filter(p=>pageNeedsCheck(p)&&!p.checked).length;
     const lines=read.reduce((n,p)=>n+validate(p.draft).lines.length,0), real=m!=='unread';
     return '<tr><td><b>'+esc(monthName(m))+'</b></td><td class="num">'+read.length+'</td><td class="num">'+lines+'</td><td class="num">'+imgs+' of '+ps.length+'</td><td class="num">'+(chk?'<span class="chip pending">'+chk+'</span>':'')+'</td><td class="acts" style="white-space:normal">'+
-     (real?'<button type="button" class="btn ghost" data-act="showMonth" data-m="'+m+'">Show report</button> <button type="button" class="btn ghost" data-act="excelMonth" data-m="'+m+'">Excel</button> <button type="button" class="btn" data-act="backupMonth" data-m="'+m+'"'+(lib?'':' disabled')+'>Download backup</button> '+(imgs?'<button type="button" class="link" data-act="freeMonth" data-m="'+m+'">Free up space</button>':''):'<span class="hint">Press Read first</span>')+'</td></tr>';
+     (real?'<button type="button" class="btn ghost" data-act="showMonth" data-m="'+m+'">Show report</button> <button type="button" class="btn ghost" data-act="excelMonth" data-m="'+m+'">Excel</button> <button type="button" class="btn" data-act="backupMonth" data-m="'+m+'"'+(lib?'':' disabled')+'>Download backup</button> '+(imgs&&!(typeof CLOUD!=='undefined'&&CLOUD.on)?'<button type="button" class="link" data-act="freeMonth" data-m="'+m+'">Free up space</button>':''):'<span class="hint">Press Read first</span>')+'</td></tr>';
   }).join('');
   return '<p class="lede">Every slip is filed under the month of its issue date. Download a backup for each month and keep it in OneDrive: it holds the scan of every slip (named by date, doc no. and technician), everything read and corrected, and the Excel report, and it can be restored here on any computer.</p>'+
    (lib?'':'<div class="banner" style="margin:0 0 12px">The backup library did not load. Check the internet connection and reload the page.</div>')+
    '<div class="tbl"><table class="data"><thead><tr><th>Month</th><th class="num">Slips</th><th class="num">Lines</th><th class="num">Scans kept here</th><th class="num">To check</th><th>Actions</th></tr></thead><tbody>'+(rowsH||'<tr><td colspan="6">No pages yet.</td></tr>')+'</tbody></table></div>'+
    '<h2>Restore a backup</h2><p>Choose a backup file (.zip) made by this app. Slips that are already here are kept as they are; scans missing on this computer are put back.</p><p><label class="btn ghost">Choose a backup<input type="file" id="restoreZip" accept=".zip,application/zip" class="sr-only"'+(lib?'':' disabled')+'></label></p>'+
    '<h2>Free up space</h2><p class="hint">“Free up space” removes a month’s scan images from this computer after you have downloaded its backup. The readings stay, so the reports still work; restore the backup or drop the PDF again to see the scans.</p>'+
-   '<p><button type="button" class="link" data-act="clearScans">Remove every page from this computer</button> <span class="hint">(download the backups first)</span></p>';
+   ((typeof CLOUD!=='undefined'&&CLOUD.on)?'<p class="hint">Shared database: remove pages one at a time on the Pages tab. Backups are still worth keeping in OneDrive.</p>':'<p><button type="button" class="link" data-act="clearScans">Remove every page from this computer</button> <span class="hint">(download the backups first)</span></p>');
 }
 const safeName=v=>String(v||'').replace(/[^A-Za-z0-9._-]+/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').slice(0,40);
 async function backupMonth(m){
@@ -1466,6 +1746,7 @@ async function backupMonth(m){
   const pages=S.scan.pages.filter(p=>pageMonth(p)===m).slice().sort((a,b)=>String(a.draft&&a.draft.date).localeCompare(String(b.draft&&b.draft.date))||String(a.draft&&a.draft.docNo).localeCompare(String(b.draft&&b.draft.docNo))||(a.order||0)-(b.order||0));
   if(!pages.length){ toast('Nothing to back up for '+monthName(m)+'.'); return; }
   toast('Preparing the backup for '+monthName(m)+'…');
+  for(const pg of pages) if(!pg.blob&&pg.remoteImage&&typeof cloudBlob==='function') await cloudBlob(pg);
   const zip=new window.JSZip(), recs=[], used=new Set(); let n=0, noImg=0;
   for(const pg of pages){
     const d=pg.draft||{}; let base=[d.date||'no-date',d.docNo||'no-doc',safeName(d.technician)||'',safeName((pg.name||'').replace(/\.pdf$/i,''))+'-p'+String(pg.pageNo).padStart(3,'0')].filter(Boolean).join('__');
@@ -1519,7 +1800,7 @@ function findSlip(id){
 function previewHTML(slip,pg,li){
   const un=new Set(slip.uncertain||[]), rows=flatten([slip]);
   const f=(label,key,val)=>'<div class="'+(un.has(key)?'unsure':'')+'"><span>'+label+'</span>'+(esc(val)||'–')+'</div>';
-  const img=pg&&pg.blob?'<div class="bar"><span>'+esc(pg.name)+' – page '+pg.pageNo+'</span><span class="tools"><button type="button" class="icon" data-act="pvZoomOut" aria-label="Zoom out" title="Zoom out">−</button><button type="button" class="icon" data-act="pvFit" title="Fit">Fit</button><button type="button" class="icon" data-act="pvZoomIn" aria-label="Zoom in" title="Zoom in">+</button><button type="button" class="icon" data-act="pvRot" data-d="-90" aria-label="Turn left" title="Turn left">⟲</button><button type="button" class="icon" data-act="pvRot" data-d="90" aria-label="Turn right" title="Turn right">⟳</button></span></div><div class="imgbox"><img id="pvImg" style="width:'+Math.round((S.pvZoom||1)*100)+'%" alt="Scanned slip"></div>'
+  const img=pg&&(pg.blob||pg.remoteImage)?'<div class="bar"><span>'+esc(pg.name)+' – page '+pg.pageNo+'</span><span class="tools"><button type="button" class="icon" data-act="pvZoomOut" aria-label="Zoom out" title="Zoom out">−</button><button type="button" class="icon" data-act="pvFit" title="Fit">Fit</button><button type="button" class="icon" data-act="pvZoomIn" aria-label="Zoom in" title="Zoom in">+</button><button type="button" class="icon" data-act="pvRot" data-d="-90" aria-label="Turn left" title="Turn left">⟲</button><button type="button" class="icon" data-act="pvRot" data-d="90" aria-label="Turn right" title="Turn right">⟳</button></span></div><div class="imgbox"><img id="pvImg" style="width:'+Math.round((S.pvZoom||1)*100)+'%" alt="Scanned slip"></div>'
     :'<p class="hint">'+(pg?'The scan image is not loaded. Drop the same PDF again to see it.':'There is no scan image for this slip.')+'</p>';
   const lines=rows.map(r=>{ const u=new Set(r.l.uncertain||[]), c=k=>u.has(k)?' unsure':'';
     return '<tr'+(r.i===li?' class="hlrow"':'')+'><td>'+(r.i+1)+'</td><td class="wrap'+c('desc')+'">'+esc(r.l.desc||r.material)+'</td><td class="'+c('sr')+'">'+esc(r.l.sr||'')+'</td><td class="num'+c('qty')+'">'+nf(r.qty)+'</td><td class="'+c('uom')+'">'+esc(r.l.uom||'')+'</td><td class="'+c('unit')+'">'+(r.unit?'<b>'+esc(r.unit)+'</b>':esc(r.l.unit||''))+'</td><td class="wrap'+c('place')+'">'+esc(r.unit?(r.l.place||''):(r.loc==='(not stated)'?'':r.loc))+'</td><td class="doc'+c('lineDoc')+'">'+docCell(r.doc)+'</td><td>'+statusChip(r.status)+'</td><td class="wrap">'+(r.l.flag&&slip.source!=='import'?'<span style="color:var(--stamp)">'+esc(r.l.flag)+'</span> ':'')+'<span class="hint">'+esc(r.l.note||(slip.source==='import'?r.l.flag||'':''))+'</span></td></tr>'; }).join('');
@@ -1542,7 +1823,7 @@ function closePreview(){ const d=$('#drawer'); if(d){ d.hidden=true; d.innerHTML
 async function editSlip(id,li){
   closePreview();
   if(S.tab==='edit'&&S.editor){ if(!(await leaveEditor())) return; }
-  if(S.tab==='scan'||S.tab==='edit'){ const pg=S.scan.pages.find(p=>p.draft&&p.draft.id===id); if(pg){ openScanReview(pg,li); return; } }
+  const pg=S.scan.pages.find(p=>p.draft&&p.draft.id===id); if(pg){ openScanReview(pg,li); return; }
   openSlip(id,li);
 }
 function showMaterial(m){
@@ -1552,6 +1833,8 @@ function showMaterial(m){
 
 /* ---------- hooks (the standalone file replaces these) ---------- */
 function usageHTML(){ return ''; }
+async function saveSapData(d){ S._sapMem=d; }
+async function loadSapData(){ return S._sapMem||null; }
 function keepImage(pg){}
 function forgetImages(pages){}
 function pageRecord(pg){ return {key:pg.key,fileKey:pg.fileKey||'',page:pg.pageNo,name:pg.name,draft:pg.draft,rot:pg.rot||0,aiRot:pg.aiRot||0,checked:!!pg.checked,manual:!!pg.manual,order:pg.order||0,at:new Date().toISOString()}; }
@@ -1572,6 +1855,7 @@ function armed(btn,label){
 function refreshLines(){ $('#lineRows').innerHTML=linesHTML(); }
 function onAct(a){
   if(extraAct(a)) return;
+  if(sapAct(a)) return;
   const k=a.dataset.act, e=S.editor;
   const liOf=x=>x.dataset.li!=null&&x.dataset.li!==''?+x.dataset.li:null;
   if(k==='preview'){ openPreview(a.dataset.sid,liOf(a)); return; }
@@ -1640,12 +1924,14 @@ function bindEvents(){
   let deb=0;
   document.addEventListener('input',ev=>{
     const t=ev.target;
+    if(sapInput(t,'input')) return;
     if(t.id==='sq'){ clearTimeout(deb); deb=setTimeout(()=>{ S.scan.q=t.value; const pos=t.selectionStart; refreshScan(true); const n=$('#sq'); if(n){ n.focus(); try{ n.setSelectionRange(pos,pos); }catch(e){} } },250); return; }
     if(t.id==='q'||t.id==='rq'){ clearTimeout(deb); deb=setTimeout(()=>{ if(t.id==='q'){ S.q=t.value; $('#slipTable').innerHTML=slipTableHTML(); } else { S.rq=t.value; $('#repBody').innerHTML=repBodyHTML(); } },180); }
     else if(t.matches&&t.matches('#lineRows [data-f="unit"]')){ const box=$('[data-u="'+t.closest('tr').dataset.i+'"]'); if(box) box.innerHTML=unitText(t.value); }
   });
   document.addEventListener('change',ev=>{
     const t=ev.target;
+    if(sapInput(t,'change')) return;
     if(extraChange(t)) return;
     if(t.id==='monthSel'){ S.month=t.value; S.monthAuto=false; lsSet('sir.month',S.month); if(S.tab==='new'||S.tab==='edit'||S.tab==='scan') renderChrome(); else render(); }
     else if(t.id==='dept'){ S.dept=t.value; $('#slipTable').innerHTML=slipTableHTML(); }
@@ -1697,8 +1983,8 @@ function idb(){
   if(!idbP) idbP=new Promise((res,rej)=>{
     if(!window.indexedDB){ rej(new Error('no browser storage')); return; }
     let done=false; const fail=e=>{ if(!done){ done=true; rej(e); } };
-    let r; try{ r=indexedDB.open('stores-issue-register',2); }catch(e){ fail(e); return; }
-    r.onupgradeneeded=()=>{ const d=r.result; for(const n of ['reads','batch','images']) if(!d.objectStoreNames.contains(n)) d.createObjectStore(n,{keyPath:'key'}); };
+    let r; try{ r=indexedDB.open('stores-issue-register',3); }catch(e){ fail(e); return; }
+    r.onupgradeneeded=()=>{ const d=r.result; for(const n of ['reads','batch','images','sap']) if(!d.objectStoreNames.contains(n)) d.createObjectStore(n,{keyPath:'key'}); };
     r.onsuccess=()=>{ const d=r.result; d.onversionchange=()=>{ try{ d.close(); }catch(e){} }; if(done){ try{ d.close(); }catch(e){} return; } done=true; res(d); };
     r.onerror=()=>fail(r.error||new Error('storage error'));
     r.onblocked=()=>{ idbBlocked=true; setBanner(BLOCKED_MSG); };
@@ -1714,13 +2000,16 @@ const idbAll=s=>idbDo(s,'readonly',st=>st.getAll()).catch(()=>[]);
 const idbCount=s=>idbDo(s,'readonly',st=>st.count()).catch(()=>0);
 const idbGet=(s,k)=>idbDo(s,'readonly',st=>st.get(k)).catch(()=>null);
 let imgWarned=false;
-function keepImage(pg){ if(!pg.blob||!pg.key) return; idbDo('images','readwrite',st=>st.put({key:pg.key,blob:pg.blob,thumb:pg.thumb})).catch(()=>{ if(!imgWarned){ imgWarned=true; toast('This computer has no room to keep the scan images. The readings are still kept.'); } }); }
+function keepImage(pg){ if(CLOUD.on){ cloudSaveImage(pg); return; } if(!pg.blob||!pg.key) return; idbDo('images','readwrite',st=>st.put({key:pg.key,blob:pg.blob,thumb:pg.thumb})).catch(()=>{ if(!imgWarned){ imgWarned=true; toast('This computer has no room to keep the scan images. The readings are still kept.'); } }); }
 
 function pageRecord(pg){ return {key:pg.key,fileKey:pg.fileKey||'',page:pg.pageNo,name:pg.name,draft:pg.draft,rot:pg.rot||0,aiRot:pg.aiRot||0,checked:!!pg.checked,manual:!!pg.manual,order:pg.order||0,at:new Date().toISOString()}; }
-function cacheRead(pg){ const rec=pageRecord(pg); idbPut('batch',rec); if(pg.draft&&!pg.manual) idbPut('reads',rec); }
-function forgetImages(pages){ for(const p of pages||[]) if(p.key) idbDel('images',p.key); }
-function forgetPages(pages){ if(pages==='all'){ idbClear('batch'); idbClear('images'); return; } for(const p of pages||[]) if(p.key){ idbDel('batch',p.key); idbDel('images',p.key); } }
+function cacheRead(pg){ if(CLOUD.on){ cloudSavePage(pg); return; } const rec=pageRecord(pg); idbPut('batch',rec); if(pg.draft&&!pg.manual) idbPut('reads',rec); }
+async function saveSapData(d){ if(CLOUD.on){ await cloudSaveSap(d); return; } if(d) await idbPut('sap',{key:'data',data:d}); else await idbDel('sap','data'); }
+async function loadSapData(){ if(CLOUD.on) return cloudLoadSap(); const r=await idbGet('sap','data'); return r&&r.data||null; }
+function forgetImages(pages){ if(CLOUD.on) return; for(const p of pages||[]) if(p.key) idbDel('images',p.key); }
+function forgetPages(pages){ if(CLOUD.on){ if(pages!=='all') cloudDelete(pages); return; } if(pages==='all'){ idbClear('batch'); idbClear('images'); return; } for(const p of pages||[]) if(p.key){ idbDel('batch',p.key); idbDel('images',p.key); } }
 async function restoreReads(fk){
+  if(CLOUD.on) return 0;
   const all=await idbAll('reads'); let n=0;
   for(const v of all){
     if(!v||v.fileKey!==fk||!v.draft) continue;
@@ -1745,7 +2034,7 @@ async function pushPage(name,no,c,fk){
   const key='read_'+hash36(fk+'|'+no), ex=S.scan.pages.find(p=>p.key===key);
   if(ex){ ex.blob=blob; ex.thumb=thumb; ex.preview=''; keepImage(ex); return; }
   const pg={id:'pg'+Math.random().toString(36).slice(2,9),name,pageNo:no,fileKey:fk,key,blob,thumb,rot:0,aiRot:0,status:'new',draft:null,error:'',preview:'',order:Date.now()*100+no};
-  S.scan.pages.push(pg); keepImage(pg); idbPut('batch',pageRecord(pg));
+  S.scan.pages.push(pg); keepImage(pg); if(!CLOUD.on) idbPut('batch',pageRecord(pg));
 }
 function addManualPage(slip){
   const ex=S.scan.pages.find(p=>p.manual&&p.draft&&p.draft.id===slip.id);
@@ -1834,12 +2123,13 @@ function sampleErrText(e){
 
 /* ---- screens ---- */
 function renderChrome(){
-  const tabs=[['scan','Scan to report'],['new','New slip'],['settings','Settings'],['guide','Guide']];
+  const tabs=S.tab==='signin'?[]:[['scan','Scan to report'],['sap','SAP & G/L'],['new','New slip'],['settings','Settings'],['guide','Guide']];
   $('#tabs').innerHTML=tabs.map(([k,l])=>'<button type="button" data-tab="'+k+'"'+(curTab()===k?' aria-current="page"':'')+'>'+esc(l)+'</button>').join('');
   const ms=$('#monthSel'); if(ms&&ms.closest('label')) ms.closest('label').hidden=true;
-  $('#who').textContent='';
+  $('#who').textContent=CLOUD.on&&CLOUD.user?'Shared · '+cloudWho()+(CLOUD.err?' · not saved':''):'';
 }
 function extraView(tab){
+  if(tab==='signin') return viewSignIn();
   if(tab==='settings') return viewSettings();
   if(tab==='slips'||tab==='reports'){ S.tab='scan'; return viewScan(); }
   return null;
@@ -1857,7 +2147,7 @@ function viewSettings(){
    '<label>Reading model<select id="s-model">'+MODELS.map(([id,l])=>'<option value="'+id+'"'+((custom?id==='custom':id===S.model)?' selected':'')+'>'+esc(l)+'</option>').join('')+'</select></label>'+
    '<label id="s-custom-wrap"'+(custom?'':' hidden')+'>Model ID<input id="s-custom" value="'+esc(custom?S.model:'')+'" spellcheck="false"></label>'+
    '</div><div class="actions" style="padding:14px 0 0"><button type="button" class="btn" data-act="saveSettings">Save settings</button><button type="button" class="btn ghost" data-act="testKey">Test the key</button><span class="hint" id="s-msg"></span></div></div>'+
-   '<h2>Saved readings</h2><p><span id="s-count">Counting…</span> When the same PDF is uploaded again, these readings are used instead of reading it again.</p><p><button type="button" class="btn ghost" data-act="forgetReads">Forget saved readings</button></p>'+
+   cloudSettingsHTML()+'<h2>Saved readings</h2><p><span id="s-count">Counting…</span> When the same PDF is uploaded again, these readings are used instead of reading it again.</p><p><button type="button" class="btn ghost" data-act="forgetReads">Forget saved readings</button></p>'+
    '<h2>About the key</h2><ul><li>The key is kept only in this browser. It is never written into this file, so sharing the file does not share the key.</li><li>Anyone who uses this browser profile can find the key in the browser’s developer tools. Use a key made only for this job and set a monthly spend limit on it.</li><li>Reading is billed to the API account that owns the key. Each page is one request.</li><li>The scan images are sent to the Claude API to be read.</li></ul></section>';
 }
 function pullSettings(){
@@ -1877,6 +2167,7 @@ async function testKey(){
   catch(e){ if(m) m.textContent=sampleErrText(e); }
 }
 function extraAct(a){
+  if(cloudAct(a)) return true;
   const k=a.dataset.act;
   if(k==='saveSettings'){ saveSettings(); return true; }
   if(k==='testKey'){ testKey(); return true; }
@@ -1891,6 +2182,8 @@ function viewGuide(){
   return '<section class="guide"><h1>How to use it</h1>'+
   '<h2>Once on each computer</h2><ol><li>Open the <b>Settings</b> tab and paste the Claude API key.</li><li>Pick the reading model, press <b>Save settings</b>, then <b>Test the key</b>.</li></ol>'+
   '<h2>Scan to report</h2><ol><li>Scan the paper slips on the Sharp scanner as PDF.</li><li>Drop the PDF files on <b>Scan to report</b> (several files at once is fine) and press <b>Read</b>. Two pages are read at a time, so a long PDF takes a few minutes.</li><li>The report builds up as pages are read: material-wise detail, <b>By unit</b>, <b>Slips</b>, material summary, doc register and <b>To check</b>.</li><li>Every report row starts with two buttons: the <b>eye</b> previews the slip (scan plus everything read from it) and the <b>pencil</b> opens it for editing. In the editor the scan is on the left (zoom with − and +, turn it with the arrows) and every field is on the right. <b>Previous page</b> and <b>Next page</b> go through the slips and keep your changes.</li><li><b>Amber</b> boxes are where Claude was not sure. Check them against the scan and type the right value; the amber goes once you change it. They are also listed under <b>To check</b>.</li><li><b>Reading</b> can be Thorough (whole page plus two close-ups, best for handwriting) or Standard (whole page only, cheaper). Pages are turned upright automatically.</li><li>Each line has its own <b>Unit</b> (cluster and unit no., e.g. C5-TH08). When one slip covers several units, every line gets the unit written against it.</li><li>Press <b>Download Excel report</b> for the full workbook: material-wise detail, material summary, doc register, locations and review flags.</li></ol>'+
+  '<h2>Shared database (everyone sees the same register)</h2><ul><li>When the page is connected to the shared database (Settings, or config.js next to the page), everyone signs in with their own email and password. Slips, scans, corrections, typed slips, the SAP data and the G/L mapping are kept in the shared database, so the stores team and accounts work on the same register from any computer.</li><li>Changes from others appear within a minute, or at once with Settings → Get the latest now. A slip you have open is not changed under you.</li><li>Each person keeps their own Claude API key in Settings; it is never written to the shared database.</li><li>Monthly backups (Months &amp; backups) are still worth keeping in OneDrive.</li></ul>'+
+  '<h2>SAP &amp; G/L – moving issues out of General Consumables</h2><ol><li>Open <b>SAP &amp; G/L</b> and choose the SAP Excel file (your “GL Report Data” sheet, or any SAP export with Material Doc No, Posting Date, Material Description, Issued Qty, Unit Price, Issue Value, GL Journal Entry and WBS Element). It is kept on this computer; a newer file adds or replaces months.</li><li>Pick the month. Every SAP line posted to G/L 51570000 is placed on a unit or a location from the slips with the same doc no. and item. A doc with only one location on its slip goes there in full; a unit in the SAP WBS element is used when no slip places the line. The rest stays in General Consumables.</li><li>On <b>G/L mapping</b> enter the target G/L for each group (Residential Units, Masjid, Plaza…). Leave it empty to keep that group in General Consumables.</li><li><b>Reclass journal</b> shows the debit lines per target G/L and the credit to General Consumables, month by month. <b>Download Excel</b> gives the summary, the journal, the reclass by unit-location, by unit, by location, the full detail with every G/L JE and material doc, the exceptions and the SAP lines.</li><li>Read every month’s slips first: SAP documents without a scanned slip can only be placed through the WBS element, so more slips means more of the amount is placed.</li></ol>'+
   '<h2>Large backlogs (hundreds of slips a month)</h2><ul><li>Work one month at a time: drop that month’s PDFs, press <b>Read</b> and leave the tab open. Reading carries on page by page and picks up where it stopped if the page is closed.</li><li><b>Pages at a time</b> sets how many pages are read together (up to 4). If the API account limit is reached, reading pauses; press Read again a minute later.</li><li>Check only what is amber or under <b>To check</b>, then <b>Download Excel report</b>. Slips are filed by month automatically: open <b>Months &amp; backups</b>, press <b>Download backup</b> for the month and keep the file in OneDrive. Then <b>Free up space</b> removes that month’s scans from this computer; the readings stay.</li><li>The line under the Read button shows the API use so far and the tokens per slip, so you can work out the cost of the whole backlog from the first pages.</li><li>Several computers can read different months at the same time, each with the key, and each makes its own Excel file.</li></ul>'+
   '<h2>Typed slips</h2><p>Slips typed on <b>New slip</b> are added to the same report, so one Excel file can hold scanned and typed slips together.</p>'+
   '<h2>Where the work is kept</h2><ul><li>Readings, your corrections, typed slips and the scan images stay in this browser on this computer, also after the page is closed.</li><li>Browser storage is not a backup: clearing the browser’s data or changing computer removes it. Download a backup for every month on <b>Months &amp; backups</b> and keep the files in OneDrive. A backup holds every scan (named by date, doc no. and technician), everything read and corrected, and the Excel report, and <b>Choose a backup</b> restores it on any computer.</li><li>To share results, send the downloaded Excel file. Another computer only sees what was read on it.</li></ul>'+
@@ -1901,14 +2194,174 @@ async function init(){
   S.remember=lsGet('sir.remember')!=='0'; S.apiKey=lsGet('sir.apiKey')||''; S.model=lsGet('sir.model')||'claude-opus-5-5';
   S.sample=apiSample(); S.downloads=browserDownloads(); S.aiImages=!!S.apiKey; S.aiChecked=true; S.imgMax=5; S.scan.depth=lsGet('sir.depth')||'thorough'; S.scan.par=+(lsGet('sir.par')||2); S.scan.verify=lsGet('sir.verify')!=='0';
   bindEvents();
+  if(cloudWanted()){
+    if(!cloudReady()){ S.tab='signin'; CLOUD.loginErr='The shared database could not be reached. Check the internet connection and reload the page.'; render(); return; }
+    CLOUD.on=true;
+    try{ const {data}=await cloudClient().auth.getSession(); CLOUD.user=data&&data.session&&data.session.user||null; }catch(e){}
+    if(!CLOUD.user){ S.tab='signin'; render(); return; }
+    await cloudStart(); return;
+  }
   if(!S.apiKey) S.tab='settings';
   render();
   let n=0;
-  try{ await idb(); n=await restoreBatch(); }
+  try{ await idb(); n=await restoreBatch(); try{ S.sap=await loadSapData(); }catch(e){} }
   catch(e){ if(idbBlocked) setBanner(BLOCKED_MSG); else setBanner('Saved work could not be opened on this computer ('+((e&&e.message)||'storage error')+'). You can still read scans and download the report, but nothing is kept after closing.'); }
   if(n){ render(); toast(pl(n,'page')+' from your last session '+(n===1?'is':'are')+' back in the report.'); }
   else if(!S.apiKey) toast('Add the Claude API key to start reading scans.');
 }
+
+
+/* ---- shared database (Supabase): everyone who signs in sees the same slips, scans, SAP data and G/L mapping ---- */
+const CLOUD={on:false,client:null,user:null,lastSync:'',timers:new Map(),asked:new Set(),busy:false,poll:0,err:''};
+function cloudConf(){ const c=window.SIR_CONFIG||{}, u=(lsGet('sir.sbUrl')||'').trim(), k=(lsGet('sir.sbKey')||'').trim(); return {url:u||String(c.supabaseUrl||'').trim(),key:k||String(c.supabaseKey||'').trim(),fromFile:!u&&!!c.supabaseUrl}; }
+function cloudWanted(){ const c=cloudConf(); return !!(c.url&&c.key); }
+function cloudReady(){ return cloudWanted()&&!!(window.supabase&&window.supabase.createClient); }
+function cloudClient(){ if(!CLOUD.client){ const c=cloudConf(); CLOUD.client=window.supabase.createClient(c.url,c.key,{auth:{persistSession:true,autoRefreshToken:true,storageKey:'sir-auth'}}); } return CLOUD.client; }
+function cloudWho(){ return CLOUD.user&&(CLOUD.user.email||CLOUD.user.id)||''; }
+function cloudErr(e,what){ const m=(e&&(e.message||e.error_description||e.code))||'unknown error'; CLOUD.err=m; setBanner('Could not '+(what||'save to the shared database')+': '+m+'. Check the internet connection; your last change may not be saved yet.'); }
+const PAGE_COLS='key,file_key,name,page_no,ord,status,checked,manual,rot,ai_rot,draft,has_image,updated_at,deleted';
+function rowToPage(r,ex){
+  const id=ex?ex.id:'pg'+Math.random().toString(36).slice(2,9), d=r.draft||null; if(d) d.fromScan=id;
+  return Object.assign(ex||{blob:null,thumb:'',error:'',preview:''},{id,name:r.name||'',pageNo:r.page_no||0,fileKey:r.file_key||'',key:r.key,rot:r.rot||0,aiRot:r.ai_rot||0,status:d?(r.status==='saved'?'saved':'read'):'new',draft:d,checked:!!r.checked,manual:!!r.manual,order:+r.ord||0,remoteImage:!!r.has_image,rotKnown:true});
+}
+function pageToRow(pg){
+  const d=pg.draft?JSON.parse(JSON.stringify(pg.draft)):null;
+  return {key:pg.key,file_key:pg.fileKey||'',name:pg.name||'',page_no:pg.pageNo||0,ord:pg.order||0,status:pg.status==='saved'?'saved':(d?'read':'new'),checked:!!pg.checked,manual:!!pg.manual,rot:pg.rot||0,ai_rot:pg.aiRot||0,draft:d,
+    month:d&&/^\d{4}-\d{2}/.test(d.date||'')?d.date.slice(0,7):'',doc_nos:d?[...new Set([d.docNo,...(d.lines||[]).map(l=>l.lineDoc)].filter(x=>/^\d{6,}$/.test(x||'')))].join(' '):'',updated_by:cloudWho(),deleted:false};
+}
+async function cloudLoadAll(){
+  const sb=cloudClient(), out=[]; let from=0;
+  for(;;){ const {data,error}=await sb.from('slip_pages').select(PAGE_COLS).eq('deleted',false).order('ord',{ascending:true}).range(from,from+999); if(error) throw error; out.push(...(data||[])); if(!data||data.length<1000) break; from+=1000; }
+  S.scan.pages=out.map(r=>rowToPage(r));
+  CLOUD.lastSync=out.reduce((m,r)=>r.updated_at>m?r.updated_at:m,'')||'1970-01-01T00:00:00Z';
+  return out.length;
+}
+function cloudSavePage(pg){ if(!pg||!pg.key||pg.status==='reading') return; clearTimeout(CLOUD.timers.get(pg.key)); CLOUD.timers.set(pg.key,setTimeout(()=>cloudPushPage(pg),700)); }
+async function cloudPushPage(pg){
+  CLOUD.timers.delete(pg.key);
+  const row=pageToRow(pg); if(pg.remoteImage) row.has_image=true;
+  const {error}=await cloudClient().from('slip_pages').upsert(row,{onConflict:'key'});
+  if(error) cloudErr(error); else if(CLOUD.err){ CLOUD.err=''; setBanner(''); }
+}
+async function cloudFlush(){ const ks=[...CLOUD.timers.keys()]; for(const k of ks){ clearTimeout(CLOUD.timers.get(k)); const pg=S.scan.pages.find(p=>p.key===k); if(pg) await cloudPushPage(pg); else CLOUD.timers.delete(k); } }
+async function cloudSaveImage(pg){
+  if(!pg.blob||!pg.key) return;
+  try{
+    let up=pg.blob;
+    try{ const bmp=await createImageBitmap(pg.blob), k=Math.min(1,2000/Math.max(bmp.width,bmp.height)); if(k<1){ const c=document.createElement('canvas'); c.width=Math.round(bmp.width*k); c.height=Math.round(bmp.height*k); c.getContext('2d').drawImage(bmp,0,0,c.width,c.height); up=await toBlob(c,'image/jpeg',0.82)||pg.blob; } if(bmp.close) bmp.close(); }catch(e){}
+    const sb=cloudClient(), {error}=await sb.storage.from('scans').upload(pg.key+'.jpg',up,{upsert:true,contentType:'image/jpeg'});
+    if(error){ cloudErr(error,'save the scan image'); return; }
+    pg.remoteImage=true;
+    const row=Object.assign(pageToRow(pg),{has_image:true,thumb:pg.thumb||null}), r2=await sb.from('slip_pages').upsert(row,{onConflict:'key'});
+    if(r2.error) cloudErr(r2.error);
+  }catch(e){ cloudErr(e,'save the scan image'); }
+}
+async function cloudBlob(pg){
+  if(!pg||pg.blob||!pg.remoteImage||!CLOUD.on) return pg&&pg.blob;
+  const {data,error}=await cloudClient().storage.from('scans').download(pg.key+'.jpg');
+  if(error||!data) return null; pg.blob=data; return data;
+}
+async function cloudThumbs(){
+  if(!CLOUD.on) return;
+  const want=S.scan.pages.filter(p=>!p.thumb&&p.remoteImage&&!CLOUD.asked.has(p.key)).map(p=>p.key).slice(0,200);
+  if(!want.length) return; want.forEach(k=>CLOUD.asked.add(k));
+  for(let i=0;i<want.length;i+=100){
+    const {data,error}=await cloudClient().from('slip_pages').select('key,thumb').in('key',want.slice(i,i+100)); if(error) return;
+    for(const r of data||[]){ const p=S.scan.pages.find(x=>x.key===r.key); if(p&&r.thumb) p.thumb=r.thumb; }
+  }
+  if(S.tab==='scan'&&S.scan.view==='pages'&&!isTyping()) refreshScan(true);
+}
+async function cloudDelete(pages){
+  const keys=(pages||[]).map(p=>p.key).filter(Boolean); if(!keys.length) return;
+  const sb=cloudClient(), {error}=await sb.from('slip_pages').update({deleted:true,updated_by:cloudWho()}).in('key',keys);
+  if(error){ cloudErr(error,'remove the page'); return; }
+  await sb.storage.from('scans').remove(keys.map(k=>k+'.jpg'));
+}
+function isTyping(){ const a=document.activeElement; return !!(a&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)); }
+async function cloudSync(){
+  if(!CLOUD.on||CLOUD.busy||!CLOUD.user) return; CLOUD.busy=true;
+  try{
+    const {data,error}=await cloudClient().from('slip_pages').select(PAGE_COLS).gt('updated_at',CLOUD.lastSync).order('updated_at',{ascending:true}).limit(1000);
+    if(error) throw error;
+    let changed=0; const editing=S.editor&&S.editor.fromScan;
+    for(const r of data||[]){
+      if(r.updated_at>CLOUD.lastSync) CLOUD.lastSync=r.updated_at;
+      const ex=S.scan.pages.find(p=>p.key===r.key);
+      if(ex&&(ex.id===editing||CLOUD.timers.has(ex.key)||ex.status==='reading')) continue;
+      if(r.deleted){ if(ex){ S.scan.pages=S.scan.pages.filter(p=>p!==ex); changed++; } continue; }
+      if(ex){ const hadImg=ex.remoteImage; rowToPage(r,ex); if(!hadImg&&ex.remoteImage) CLOUD.asked.delete(ex.key); }
+      else S.scan.pages.push(rowToPage(r));
+      changed++;
+    }
+    if(changed){ S.scan.pages.sort((a,b)=>(a.order||0)-(b.order||0)); if(S.tab==='scan'&&!isTyping()) refreshScan(true); else if(S.tab==='sap'&&!isTyping()) render(); }
+    try{ const sm=await cloudClient().from('sap_months').select('month,loaded_at'); const mx=(sm.data||[]).reduce((m,r)=>r.loaded_at>m?r.loaded_at:m,''); if(!sm.error&&mx!==(CLOUD.sapAt||'')){ S.sap=await cloudLoadSap(); CLOUD.sapAt=mx; if(S.tab==='sap'&&!isTyping()) render(); } await cloudLoadSettings(); }catch(e){}
+    renderChrome();
+  }catch(e){ /* try again at the next round */ }
+  CLOUD.busy=false;
+}
+async function cloudSaveSap(d){
+  const sb=cloudClient();
+  if(!d){ const {error}=await sb.from('sap_months').delete().neq('month',''); if(error) cloudErr(error,'remove the SAP data'); return; }
+  for(const [m,ls] of groupBy(d.lines,l=>l.month||'none')){ const {error}=await sb.from('sap_months').upsert({month:m,lines:ls,file:d.file||'',loaded_by:cloudWho()},{onConflict:'month'}); if(error){ cloudErr(error,'save the SAP data'); return; } }
+}
+async function cloudLoadSap(){
+  const {data,error}=await cloudClient().from('sap_months').select('month,lines,file,loaded_at').order('month',{ascending:true}); if(error) throw error;
+  if(!data||!data.length) return null;
+  return {lines:data.flatMap(r=>r.lines||[]),file:[...new Set(data.map(r=>r.file).filter(Boolean))].join('; '),at:data.reduce((m,r)=>r.loaded_at>m?r.loaded_at:m,'')};
+}
+async function cloudSaveSetting(k,v){ const {error}=await cloudClient().from('app_settings').upsert({key:k,value:v,updated_by:cloudWho()},{onConflict:'key'}); if(error) cloudErr(error,'save the setting'); }
+async function cloudLoadSettings(){ const {data,error}=await cloudClient().from('app_settings').select('key,value'); if(error) throw error; for(const r of data||[]){ if(r.key==='glmap') S.glmap=r.value||{}; if(r.key==='glsrc') S.glsrc=String(r.value||'51570000'); } }
+async function cloudStart(){
+  $('#main').innerHTML='<div class="empty">Opening the shared database…</div>';
+  try{
+    const n=await cloudLoadAll();
+    try{ S.sap=await cloudLoadSap(); CLOUD.sapAt=S.sap&&S.sap.at||''; }catch(e){ S.sap=null; }
+    try{ await cloudLoadSettings(); }catch(e){}
+    S.tab=S.apiKey?'scan':'settings'; render();
+    toast(pl(n,'page')+' in the shared database.'+(S.apiKey?'':' Add your Claude API key to read new scans.'));
+  }catch(e){ S.tab='signin'; CLOUD.loginErr='The shared database could not be opened: '+((e&&e.message)||'unknown error')+'. Check that the setup script was run in Supabase.'; render(); return; }
+  clearInterval(CLOUD.poll); CLOUD.poll=setInterval(cloudSync,60000);
+  window.addEventListener('focus',()=>cloudSync());
+  window.addEventListener('beforeunload',e=>{ if(CLOUD.timers.size){ cloudFlush(); e.preventDefault(); e.returnValue=''; } });
+}
+async function cloudSignIn(){
+  const em=($('#li-email')||{}).value||'', pw=($('#li-pass')||{}).value||'';
+  if(!em.trim()||!pw){ CLOUD.loginErr='Enter your email and password.'; render(); return; }
+  const btn=$('#li-go'); if(btn){ btn.disabled=true; btn.textContent='Signing in…'; }
+  const {data,error}=await cloudClient().auth.signInWithPassword({email:em.trim(),password:pw});
+  if(error||!data||!data.user){ CLOUD.loginErr=(error&&error.message)||'Sign-in failed.'; render(); return; }
+  CLOUD.user=data.user; CLOUD.loginErr=''; await cloudStart();
+}
+async function cloudSignOut(){ await cloudFlush(); try{ await cloudClient().auth.signOut(); }catch(e){} location.reload(); }
+function viewSignIn(){
+  const c=cloudConf();
+  return '<section class="guide" style="max-width:460px"><h1>Sign in</h1><p class="lede">This register is shared by the stores team and accounts. Sign in with the email and password you were given.</p>'+
+   '<div class="slip" style="padding:16px 18px"><div class="fields" style="padding:0;grid-template-columns:1fr">'+
+   '<label>Email<input type="email" id="li-email" autocomplete="username" value="'+esc(lsGet('sir.lastEmail')||'')+'"></label>'+
+   '<label>Password<input type="password" id="li-pass" autocomplete="current-password"></label></div>'+
+   '<div class="actions" style="padding:14px 0 0"><button type="button" class="btn" id="li-go" data-act="cloudSignIn">Sign in</button></div>'+
+   (CLOUD.loginErr?'<p class="hint" style="color:var(--stamp)">'+esc(CLOUD.loginErr)+'</p>':'')+'</div>'+
+   '<p class="hint">Shared database: '+esc(c.url)+'. No account yet? Ask the administrator to add you in Supabase.</p></section>';
+}
+function cloudSettingsHTML(){
+  const c=cloudConf(), on=CLOUD.on&&CLOUD.user;
+  return '<h2>Shared database</h2>'+(on
+   ?'<p>Connected to <b>'+esc(c.url)+'</b> as <b>'+esc(cloudWho())+'</b>. Slips, scans, corrections, the SAP data and the G/L mapping are shared with everyone who signs in. Changes from others appear within a minute.</p><p><button type="button" class="btn ghost" data-act="cloudSync">Get the latest now</button> <button type="button" class="btn ghost" data-act="cloudSignOut">Sign out</button></p>'
+   :'<p>Not connected – the work is kept on this computer only. To share it, enter the Supabase project URL and the anon public key (Supabase → Project settings → API), then sign in.</p>')+
+   (c.fromFile?'<p class="hint">The connection comes from config.js next to this page.</p>':
+   '<div class="fields" style="padding:0;grid-template-columns:1fr"><label>Supabase project URL<input id="s-sburl" value="'+esc(lsGet('sir.sbUrl')||'')+'" placeholder="https://xxxx.supabase.co" spellcheck="false"></label><label>Anon public key<input id="s-sbkey" value="'+esc(lsGet('sir.sbKey')||'')+'" spellcheck="false"></label></div><p><button type="button" class="btn ghost" data-act="cloudSave">Save and connect</button>'+(lsGet('sir.sbUrl')?' <button type="button" class="link" data-act="cloudForget">Stop using the shared database on this computer</button>':'')+'</p>');
+}
+function cloudAct(a){
+  const k=a.dataset.act;
+  if(k==='cloudSignIn'){ lsSet('sir.lastEmail',(($('#li-email')||{}).value||'').trim()); cloudSignIn(); return true; }
+  if(k==='cloudSignOut'){ cloudSignOut(); return true; }
+  if(k==='cloudSync'){ cloudSync().then(()=>toast('Up to date.')); return true; }
+  if(k==='cloudSave'){ const u=(($('#s-sburl')||{}).value||'').trim(), key=(($('#s-sbkey')||{}).value||'').trim(); if(!/^https:\/\/.+/.test(u)||key.length<20){ toast('Enter the project URL (https://…) and the anon key.'); return true; } lsSet('sir.sbUrl',u); lsSet('sir.sbKey',key); location.reload(); return true; }
+  if(k==='cloudForget'){ if(armed(a,'Click again – this computer will work on its own')){ lsSet('sir.sbUrl',''); lsSet('sir.sbKey',''); location.reload(); } return true; }
+  return false;
+}
+
+document.addEventListener('keydown',ev=>{ const t=ev.target; if(ev.key==='Enter'&&t&&(t.id==='li-pass'||t.id==='li-email')){ ev.preventDefault(); lsSet('sir.lastEmail',(($('#li-email')||{}).value||'').trim()); cloudSignIn(); } });
 
 init();
 })();
